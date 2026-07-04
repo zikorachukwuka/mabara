@@ -1,8 +1,8 @@
 # Mabara
 
-**A push-to-talk voice coding agent. Hold a key, talk to your codebase, hear it talk back — and let it edit, with your spoken approval.**
+**A push-to-talk voice coding agent. Hold a key, talk to your codebase, hear it talk back - and let it edit, with your spoken approval.**
 
-Built in a single day of relentless benchmarking on a modest laptop (i5-10210U, 8 GB RAM, no GPU), Mabara turns Claude into a hands-free pair programmer: local ears, local mouth, cloud brain. Everything runs real-time on CPU.
+Built over a weekend of relentless benchmarking on a modest laptop (i5-10210U, 8 GB RAM, no GPU), Mabara turns Claude into a hands-free pair programmer: local ears, local mouth, cloud brain. Everything runs real-time on CPU.
 
 > 🎥 **Demo video coming here**
 
@@ -47,11 +47,11 @@ The terminal shows **artifacts, not prose**: your words, tool actions, code bloc
 ## Features
 
 - **Push-to-talk** (Right Ctrl) with an always-open mic and pre-roll buffer, so your first syllable is never clipped
-- **Streaming speech** — Mabara starts talking after its first *sentence* is ready, not after the full response; sentences batch adaptively when synthesis needs headroom
-- **Barge-in** — hold the key while Mabara talks: playback stops within 0.2s, the model stops generating, and it's instantly listening to you
-- **Voice-gated tool safety** — reads are free; every edit and shell command is spoken aloud and requires your verbal "yes"; answering *"yes, for the whole task"* auto-approves the rest of that task's edits (shell commands always ask)
-- **Git safety net** — edits only allowed inside a git repo; every edit-task gets an automatic checkpoint; **"revert that"** undoes the last task deterministically (including restoring your own untracked files rather than deleting them); **"commit this"** turns a finished task into a real commit — only the task's files, never your unrelated changes
-- **Dual-brain economics** — **"switch to haiku"** / **"switch to sonnet"** swaps the model *mid-conversation* with full context retained: quality by default, quota-stretching on demand
+- **Streaming speech** - Mabara starts talking after its first *sentence* is ready, not after the full response; sentences batch adaptively when synthesis needs headroom
+- **Barge-in** - hold the key while Mabara talks: playback stops within 0.2s, the model stops generating, and it's instantly listening to you
+- **Voice-gated tool safety** - reads are free; every edit and shell command is spoken aloud and requires your verbal "yes"; answering *"yes, for the whole task"* auto-approves the rest of that task's edits (shell commands always ask)
+- **Git safety net** - edits only allowed inside a git repo; every edit-task gets an automatic checkpoint; **"revert that"** undoes the last task deterministically (including restoring your own untracked files rather than deleting them); **"commit this"** turns a finished task into a real commit - only the task's files, never your unrelated changes
+- **Dual-brain economics** - **"switch to haiku"** / **"switch to sonnet"** swaps the model *mid-conversation* with full context retained: quality by default, quota-stretching on demand
 - **Per-repo resumable sessions**, spoken error reporting (including usage-limit warnings with reset times), path-sanitized speech (you hear "page.tsx", never "C colon backslash..."), and a `--readonly` look-don't-touch mode
 
 ## Architecture
