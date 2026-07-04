@@ -133,7 +133,7 @@ Command matchers are deliberately narrow word-allowlists — "how do I undo a co
 **Requirements:** Windows 10/11, Python 3.11+, a microphone, [Claude Code](https://claude.com/claude-code) installed and logged in (Mabara drives it through the Agent SDK), and git.
 
 ```powershell
-git clone https://github.com/YOUR-USERNAME/mabara
+git clone https://github.com/zikorachukwuka/mabara
 cd mabara
 python -m venv venv
 venv\Scripts\pip install -r requirements.txt
