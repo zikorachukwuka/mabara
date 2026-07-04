@@ -4,7 +4,10 @@
 
 Built in a single day of relentless benchmarking on a modest laptop (i5-10210U, 8 GB RAM, no GPU), Mabara turns Claude into a hands-free pair programmer: local ears, local mouth, cloud brain. Everything runs real-time on CPU.
 
-> 🎥 **Demo video coming here** — talking to a repo, approving an edit by voice, saying "revert that."
+> 🎥 **Demo video coming here**
+
+<img width="954" height="479" alt="image" src="https://github.com/user-attachments/assets/cd491e58-d2d2-41bd-bfac-689f6dcfd857" />
+
 
 ```
   __  __     _     ___     _     ___     _
