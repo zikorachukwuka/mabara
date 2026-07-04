@@ -1,0 +1,1640 @@
+import asyncio
+import re
+import time
+import queue
+import random
+import signal
+import threading
+import subprocess
+import shutil
+import sys
+import json
+import os
+import argparse
+# All models are cached locally, so skip HuggingFace Hub's startup network
+# checks. If you ever switch to a Whisper model you haven't downloaded yet,
+# run once with HF_HUB_OFFLINE=0 in the environment to allow the download.
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+
+# The Claude Agent SDK costs ~1.4s to import, and sounddevice + numpy +
+# keyboard another ~1.1s — together that was the blank-terminal time before
+# the banner's first frame. main() loads both sets in background threads
+# (alongside the STT/TTS models) while the banner draws; nothing below
+# touches these names until the matching loader has finished.
+# faster-whisper and piper are likewise imported inside the engine classes
+# that use them, off the main thread.
+ClaudeSDKClient = None
+ClaudeAgentOptions = None
+PermissionResultAllow = None
+PermissionResultDeny = None
+StreamEvent = None
+
+
+def _load_sdk():
+    global ClaudeSDKClient, ClaudeAgentOptions, \
+        PermissionResultAllow, PermissionResultDeny, StreamEvent
+    import claude_agent_sdk as sdk
+    ClaudeSDKClient = sdk.ClaudeSDKClient
+    ClaudeAgentOptions = sdk.ClaudeAgentOptions
+    PermissionResultAllow = sdk.PermissionResultAllow
+    PermissionResultDeny = sdk.PermissionResultDeny
+    StreamEvent = sdk.StreamEvent
+
+
+sd = None        # sounddevice
+np = None        # numpy
+keyboard = None
+
+_audio_import_lock = threading.Lock()
+
+
+def _load_audio():
+    """Import the audio stack (sounddevice, numpy, keyboard). Idempotent and
+    locked: both model-loader threads call it, the first one pays."""
+    global sd, np, keyboard
+    with _audio_import_lock:
+        if np is None:
+            import numpy
+            import sounddevice
+            import keyboard as _keyboard
+            np = numpy
+            sd = sounddevice
+            keyboard = _keyboard
+
+
+SAMPLERATE = 16000
+# Right Ctrl instead of space: space made typing impossible while Mabara
+# talks (any space bar press triggered barge-in). Right Ctrl is never part
+# of normal typing (shortcuts live on left Ctrl) and is comfortable to hold.
+PUSH_TO_TALK_KEY = "right ctrl"
+PTT_LABEL = "RIGHT CTRL"  # how the key is written in on-screen hints
+_HERE = os.path.dirname(os.path.abspath(__file__))
+MODELS_DIR = os.path.join(_HERE, "models")   # downloaded TTS models/voices
+DATA_DIR = os.path.join(_HERE, "data")       # runtime state (sessions, transcripts)
+os.makedirs(DATA_DIR, exist_ok=True)
+SESSION_STORE_FILE = os.path.join(DATA_DIR, "sessions.json")
+TRANSCRIPT_FILE = os.path.join(DATA_DIR, "transcripts.log")
+# fp32 on purpose: on CPUs without VNNI (like this one) the int8 model
+# benchmarks ~2.5x SLOWER than fp32, not faster.
+KOKORO_MODEL_FILE = os.path.join(MODELS_DIR, "kokoro-v1.0.onnx")
+KOKORO_VOICES_FILE = os.path.join(MODELS_DIR, "voices-v1.0.bin")
+TTS_VOICE = "af_heart"
+# User's pick after A/B (liked the accent). Community-ranked alternatives
+# downloaded alongside: en_US-hfc_male-medium ("cleanest male in the
+# catalog"), en_US-amy-medium (female). joe has no high/low variants.
+PIPER_DEFAULT_VOICE = "en_US-joe-medium"
+PIPER_LENGTH_SCALE = 0.95  # <1.0 speaks faster; stock pacing sounds drawly
+# User's pick after listening to M1-M5 at 1.15x pacing. 8 steps = full
+# quality at 2.1x real-time on this CPU. Bonus: M1 is the voice that
+# survives 4 steps (4.2x) with little quality loss, so if speed is ever
+# needed again, drop SUPERTONIC_STEPS to 4.
+SUPERTONIC_VOICE = "M1"
+SUPERTONIC_STEPS = 4  # halves synthesis time vs 8; M1 holds up at 4, and it
+                      # cuts the silent gap before the first spoken word
+SUPERTONIC_SPEED = 1.22  # >1 speaks faster; package default 1.05 felt slow
+
+
+# ---------- Terminal styling ----------
+
+os.system("")  # switches Windows consoles into ANSI escape mode
+_USE_COLOR = sys.stdout.isatty()
+
+
+def _style(code):
+    def apply(text):
+        if not _USE_COLOR:
+            return str(text)
+        return f"\033[{code}m{text}\033[0m"
+    return apply
+
+
+dim = _style("2")
+cyan = _style("1;96")    # the user
+accent = _style("1;95")  # Mabara
+yellow = _style("1;93")
+green = _style("92")
+red = _style("91")
+
+
+def _safe_glyph(char, fallback):
+    """Degrade to ASCII when stdout can't encode the pretty glyph
+    (e.g. piped output on Windows uses cp1252, not the console's UTF-8)."""
+    try:
+        char.encode(sys.stdout.encoding or "utf-8")
+        return char
+    except (UnicodeEncodeError, LookupError):
+        return fallback
+
+
+# Stick to CP437-era glyphs — fancier ones (⋮ ✓) encode fine but render as
+# boxes in classic Windows console fonts.
+DOT = _safe_glyph("●", "*")
+TOOL_MARK = _safe_glyph("·", "|")   # tool-action lines
+CHECK = _safe_glyph("√", "+")       # end-of-task marker
+SUB_MARK = _safe_glyph("♪", ">")    # live speech subtitle
+
+_LINE_WIDTH = 72
+
+
+def status(text):
+    """Overwrite the single in-place status line (no newline)."""
+    print("\r" + " " * _LINE_WIDTH + f"\r  {text}", end="", flush=True)
+
+
+def clear_status():
+    print("\r" + " " * _LINE_WIDTH + "\r", end="", flush=True)
+
+# Set once at startup in main(), used by the permission callback
+stt = None
+speaker = None
+recorder = None
+git_safety = None
+readonly_mode = False
+debug_mode = False
+
+# Seconds from query to Claude's first text delta, set by ask_claude each
+# turn — the number that separates "model is slow" from "audio is slow"
+_first_token_secs = None
+
+# Whether this conversation was saved for resume; read by the Ctrl+C handler
+session_saved = False
+
+# True while a voice approval is capturing the push-to-talk key, so the barge-in watcher
+# doesn't mistake the answer for "cut Claude off"
+_approval_active = False
+
+# True after the user answers "yes, for the whole task": remaining Edit/Write
+# calls in the current task auto-approve (Bash always asks). Reset per turn.
+_task_approval = False
+
+
+# ---------- CLI args ----------
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Voice coding assistant")
+    parser.add_argument(
+        "--repo",
+        default=".",
+        help="Path to the codebase you want to talk about (default: current directory)",
+    )
+    parser.add_argument(
+        "--model",
+        default="sonnet",
+        help="Starting Claude model: an alias (sonnet, haiku, opus) or a full "
+             "model id, e.g. claude-sonnet-5. Switch anytime by voice: "
+             "'switch to haiku' stretches your usage quota for casual "
+             "sessions, 'switch to sonnet' restores quality (default: sonnet)",
+    )
+    parser.add_argument(
+        "--stt",
+        default="parakeet",
+        choices=["parakeet", "small.en", "distil-small.en", "base.en"],
+        help="Transcription model: parakeet (nvidia parakeet-tdt-0.6b-v2) is "
+             "both faster and more accurate than the whisper options on this "
+             "machine (default: parakeet)",
+    )
+    parser.add_argument(
+        "--tts",
+        default="piper",
+        choices=["piper", "supertonic", "kokoro"],
+        help="Voice engine: piper is the snappy default (~0.4s to first "
+             "word); supertonic sounds more natural but takes ~1.6s to start "
+             "speaking; kokoro can't keep up on this CPU (default: piper)",
+    )
+    parser.add_argument(
+        "--voice",
+        default=PIPER_DEFAULT_VOICE,
+        help="Piper voice name; its .onnx must be in the models folder. "
+             "Downloaded: en_US-hfc_male-medium, en_US-joe-medium, "
+             "en_US-amy-medium. Ignored with --tts kokoro. "
+             f"(default: {PIPER_DEFAULT_VOICE})",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Show per-turn timing (transcription, Claude first token) to "
+             "diagnose where response lag comes from",
+    )
+    parser.add_argument(
+        "--readonly",
+        action="store_true",
+        help="Look-don't-touch session: Edit, Write, and Bash are refused "
+             "outright, no approval prompts — nothing in the repo can change",
+    )
+    return parser.parse_args()
+
+
+# ---------- Session persistence ----------
+
+def load_sessions():
+    if not os.path.exists(SESSION_STORE_FILE):
+        return {}
+    try:
+        with open(SESSION_STORE_FILE, "r") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, IOError):
+        return {}
+
+
+def save_session(repo_path, session_id):
+    sessions = load_sessions()
+    sessions[repo_path] = session_id
+    with open(SESSION_STORE_FILE, "w") as f:
+        json.dump(sessions, f, indent=2)
+
+
+def prompt_resume(session_id):
+    """Enter defaults to yes — if you're being asked at all, you were in the
+    middle of something on this repo last time.
+
+    The question is printed via sys.stdout and input() is called BARE:
+    input(prompt) hands the prompt to the C runtime's console readline
+    path rather than sys.stdout, and on this setup that write never
+    reached the screen — the app sat waiting on an invisible question."""
+    print(f"  {accent(DOT)} pick up where you left off? {dim('(Y/n)')} ",
+          end="", flush=True)
+    try:
+        answer = input()
+    except EOFError:
+        return False
+    return not answer.strip().lower().startswith("n")
+
+
+def append_transcript(role, text):
+    """The terminal only shows subtitles while Mabara speaks; the full prose
+    lands here so it can always be re-read."""
+    if not text:
+        return
+    try:
+        with open(TRANSCRIPT_FILE, "a", encoding="utf-8") as f:
+            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {role}: {text}\n")
+    except OSError:
+        pass
+
+
+# ---------- Git safety net (checkpoints + voice revert) ----------
+
+class GitSafety:
+    """Edits are only allowed inside a git repository, and every task that
+    touches files gets a checkpoint: a `git stash create` snapshot of the
+    working tree, taken lazily at the first approved edit, plus in-memory
+    backups of untracked files (which a stash snapshot doesn't cover — a
+    naive revert would delete the user's own uncommitted new files).
+    'Revert that' restores everything the last edit-task touched."""
+
+    def __init__(self, repo_path):
+        self.repo = repo_path
+        proc = self._git("rev-parse", "--is-inside-work-tree")
+        self.enabled = proc is not None and proc.stdout.strip() == "true"
+        status = self._git("status", "--porcelain") if self.enabled else None
+        self.dirty = bool(status.stdout.strip()) if status else False
+        self._turn = 0
+        self._ckpt_turn = None   # turn the current checkpoint belongs to
+        self._baseline = None    # stash-create sha; None means use HEAD
+        self._touched = []       # absolute paths of approved Edit/Write targets
+        self._untracked_backup = {}  # path -> original bytes
+        self._bash_ran = False
+        self._task_label = ""    # user's words for the task that got the checkpoint
+        self._pending_label = ""
+
+    def _git(self, *args):
+        try:
+            return subprocess.run(
+                ["git", "-C", self.repo, *args],
+                capture_output=True, text=True, timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+
+    def _is_tracked(self, path):
+        proc = self._git("ls-files", "--error-unmatch", "--", path)
+        return proc is not None and proc.returncode == 0
+
+    def begin_turn(self, label=""):
+        self._turn += 1
+        self._pending_label = label
+
+    def before_mutation(self, tool_name, tool_input):
+        """Called when the user approves a mutating tool. Snapshots the tree
+        once per turn and remembers which files the task touches."""
+        if not self.enabled:
+            return
+        if self._ckpt_turn != self._turn:
+            self._ckpt_turn = self._turn
+            proc = self._git("stash", "create", "mabara checkpoint")
+            self._baseline = (proc.stdout.strip() or None) if proc else None
+            self._touched = []
+            self._untracked_backup = {}
+            self._bash_ran = False
+            self._task_label = self._pending_label
+        if tool_name in ("Edit", "Write"):
+            path = tool_input.get("file_path")
+            if path:
+                path = os.path.abspath(path)
+                if path not in self._touched:
+                    self._touched.append(path)
+                    if os.path.exists(path) and not self._is_tracked(path):
+                        try:
+                            with open(path, "rb") as f:
+                                self._untracked_backup[path] = f.read()
+                        except OSError:
+                            pass
+        elif tool_name == "Bash":
+            self._bash_ran = True
+
+    def revert(self):
+        """Undo the last edit-task. Returns a short spoken summary."""
+        if not self.enabled:
+            return "There's no safety net here — this folder isn't a git repository."
+        if not self._touched and not self._bash_ran:
+            return "There's nothing to revert."
+        baseline = self._baseline or "HEAD"
+        restored = removed = failed = 0
+        for path in self._touched:
+            rel = os.path.relpath(path, self.repo)
+            if path in self._untracked_backup:
+                try:
+                    with open(path, "wb") as f:
+                        f.write(self._untracked_backup[path])
+                    restored += 1
+                except OSError:
+                    failed += 1
+                continue
+            proc = self._git("checkout", baseline, "--", rel)
+            if proc is not None and proc.returncode == 0:
+                restored += 1
+            elif not self._is_tracked(path) and os.path.exists(path):
+                # File didn't exist at the checkpoint: it was created by the
+                # task, so undoing means deleting it
+                try:
+                    os.remove(path)
+                    removed += 1
+                except OSError:
+                    failed += 1
+            else:
+                failed += 1
+        parts = []
+        if restored:
+            parts.append(f"restored {restored} file" + ("s" if restored != 1 else ""))
+        if removed:
+            parts.append(f"removed {removed} new file" + ("s" if removed != 1 else ""))
+        if failed:
+            parts.append(f"couldn't revert {failed}")
+        message = ("Done — " + " and ".join(parts) + ".") if parts \
+            else "That task didn't change any files."
+        if self._bash_ran:
+            message += " Note: shell commands from that task can't be undone automatically."
+        # One-shot: a second 'revert that' shouldn't re-fire on stale state
+        self._touched = []
+        self._untracked_backup = {}
+        self._bash_ran = False
+        self._ckpt_turn = None
+        return message
+
+    def commit_preview(self):
+        """(paths, subject) for a would-be commit of the last edit-task's
+        files, or None if there's nothing to commit."""
+        if not self.enabled or not self._touched:
+            return None
+        paths = [p for p in self._touched if os.path.exists(p)]
+        if not paths:
+            return None
+        label = re.sub(r"\s+", " ", self._task_label).strip().rstrip(".?!")
+        subject = f"mabara: {label[:60]}" if label else "mabara: voice task changes"
+        return paths, subject
+
+    def commit(self, subject):
+        """Commit only the last task's touched files (never the user's own
+        unrelated changes). Returns a short spoken outcome."""
+        preview = self.commit_preview()
+        if preview is None:
+            return "There's nothing to commit."
+        paths, _ = preview
+        rels = [os.path.relpath(p, self.repo) for p in paths]
+        self._git("add", "--", *rels)
+        proc = self._git("commit", "-m", subject, "--", *rels)
+        if proc is None or proc.returncode != 0:
+            detail = ((proc.stderr or proc.stdout).strip() if proc else "git unavailable")
+            print(f"  {red('!')} {detail[:200]}")
+            return "The commit failed — details are on your screen."
+        # Committed work is no longer checkpoint-revertable state
+        self._touched = []
+        self._untracked_backup = {}
+        self._bash_ran = False
+        self._ckpt_turn = None
+        n = len(rels)
+        return f"Committed {n} file" + ("s." if n != 1 else ".")
+
+
+_COMMIT_WORDS = {
+    "commit", "that", "this", "it", "them", "these", "the", "change",
+    "changes", "task", "tasks", "work", "edit", "edits", "please", "now",
+}
+
+
+def is_commit_command(text):
+    """True only for short, unambiguous commands like 'commit this' —
+    questions about commits go to Claude as normal conversation."""
+    words = re.findall(r"[a-z']+", text.lower())
+    return (bool(words) and words[0] == "commit"
+            and len(words) <= 6 and all(w in _COMMIT_WORDS for w in words))
+
+
+_MODEL_ALIASES = {
+    "sonnet": "sonnet", "sonet": "sonnet", "sonnets": "sonnet",
+    "haiku": "haiku", "opus": "opus",
+}
+_SWITCH_FILLER = {
+    "switch", "use", "change", "to", "the", "model", "brain",
+    "please", "now", "over",
+}
+
+
+def model_switch_target(text):
+    """'switch to sonnet' → 'sonnet'; None for anything that isn't a short,
+    unambiguous switch command (questions about models go to Claude)."""
+    words = re.findall(r"[a-z']+", text.lower())
+    if not words or words[0] not in ("switch", "use", "change") or len(words) > 6:
+        return None
+    models = [_MODEL_ALIASES[w] for w in words if w in _MODEL_ALIASES]
+    if len(models) != 1:
+        return None
+    if all(w in _SWITCH_FILLER or w in _MODEL_ALIASES for w in words):
+        return models[0]
+    return None
+
+
+_REVERT_WORDS = {
+    "revert", "undo", "that", "this", "it", "everything", "all", "your",
+    "the", "last", "change", "changes", "edit", "edits", "task", "tasks",
+    "please", "now",
+}
+
+
+def is_revert_command(text):
+    """True only for short, unambiguous commands like 'revert that' or
+    'undo your last changes' — anything wordier goes to Claude as usual."""
+    words = re.findall(r"[a-z']+", text.lower())
+    return (bool(words) and words[0] in ("revert", "undo")
+            and len(words) <= 6 and all(w in _REVERT_WORDS for w in words))
+
+
+# ---------- Sync helpers (recording + transcription) ----------
+
+class Recorder:
+    """Keeps the mic stream open for the whole session. Opening the device
+    only after the key is pressed loses its startup time — the first syllable
+    gets clipped and transcription suffers. A short pre-roll buffer also
+    catches speech that starts a beat before the key registers."""
+
+    PREROLL_SECONDS = 0.3
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._preroll = []   # (timestamp, block) pairs kept while idle
+        self._frames = None  # active recording, or None when idle
+        self.stream = sd.InputStream(
+            samplerate=SAMPLERATE, channels=1, callback=self._callback
+        )
+        self.stream.start()
+
+    def _callback(self, indata, frames_count, time_info, status):
+        now = time.time()
+        block = indata.copy()
+        with self._lock:
+            if self._frames is not None:
+                self._frames.append(block)
+            else:
+                self._preroll.append((now, block))
+                cutoff = now - self.PREROLL_SECONDS
+                while self._preroll and self._preroll[0][0] < cutoff:
+                    self._preroll.pop(0)
+
+    def record_while_held(self, prompt=None, key=PUSH_TO_TALK_KEY):
+        if prompt is None:
+            prompt = f"hold {PTT_LABEL} to talk"
+        status(dim(f"» {prompt}"))
+        while not keyboard.is_pressed(key):
+            time.sleep(0.01)
+
+        status(f"{red(DOT)} listening — release when done")
+        with self._lock:
+            self._frames = [block for _, block in self._preroll]
+            self._preroll = []
+
+        while keyboard.is_pressed(key):
+            time.sleep(0.01)
+
+        status(dim("transcribing..."))
+        with self._lock:
+            frames, self._frames = self._frames, None
+
+        if not frames:
+            return None
+        return np.concatenate(frames, axis=0)
+
+
+class WhisperSTT:
+    def __init__(self, model_name):
+        from faster_whisper import WhisperModel  # deferred: see _load_sdk note
+        self.model = WhisperModel(
+            model_name, device="cpu", compute_type="int8", cpu_threads=4
+        )
+
+    def transcribe(self, audio):
+        audio_flat = audio.flatten().astype(np.float32)
+        segments, info = self.model.transcribe(
+            audio_flat, beam_size=1, language="en", vad_filter=True,
+            # Domain hint: biases decoding toward developer vocabulary
+            initial_prompt="A developer asks a voice assistant about their codebase.",
+        )
+        return " ".join(segment.text.strip() for segment in segments)
+
+
+class ParakeetSTT:
+    """nvidia parakeet-tdt-0.6b-v2 via onnx-asr: benchmarked on this machine
+    at ~2x whisper-small.en speed AND better accuracy (it nearly spelled
+    'Mabara' from an old test clip whisper got wrong). int8 despite the
+    no-VNNI penalty — the fp32 model is a 2.4 GB download/footprint."""
+
+    def __init__(self):
+        import onnx_asr  # deferred: whisper users shouldn't pay the import
+        self.model = onnx_asr.load_model(
+            "nemo-parakeet-tdt-0.6b-v2", quantization="int8"
+        )
+
+    def transcribe(self, audio):
+        audio_flat = audio.flatten().astype(np.float32)
+        return self.model.recognize(audio_flat, sample_rate=SAMPLERATE).strip()
+
+
+# ---------- Text cleanup / parsing for TTS ----------
+
+def strip_markdown(text):
+    """Remove common markdown so TTS doesn't stumble over symbols."""
+    text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)              # bold
+    text = re.sub(r'\*(.*?)\*', r'\1', text)                   # italic
+    text = re.sub(r'`(.*?)`', r'\1', text)                     # inline code
+    text = re.sub(r'\|.*\|', '', text)                         # table rows
+    text = re.sub(r'^-{2,}$', '', text, flags=re.MULTILINE)    # table separators
+    text = re.sub(r'#+\s*', '', text)                          # headers
+    text = re.sub(r'([.!?:;,])\s*\n+', r'\1 ', text)           # newline already after punctuation
+    text = re.sub(r'\n+', '. ', text)                          # remaining line breaks -> pause
+    return text.strip()
+
+
+_PATHLIKE = re.compile(
+    r"[A-Za-z]:[\\/][^\s,;:]+"           # windows absolute path
+    r"|(?:[\w.\-~]+[\\/]){2,}[\w.\-]+"   # two or more separators
+    r"|[\w.\-~]+[\\/][\w\-]+\.\w{1,5}"   # dir/file.ext
+)
+
+
+def speakable(text):
+    """Swap path-like tokens for their final component in SPOKEN text only —
+    hearing 'C colon backslash Users backslash...' is noise. Exact paths
+    stay on screen (tool lines, code blocks, approval prints)."""
+    def last_component(match):
+        token = match.group(0).rstrip("\\/")
+        return re.split(r"[\\/]", token)[-1] or match.group(0)
+    return _PATHLIKE.sub(last_component, text)
+
+
+# ---------- Speaking (background synthesis + gapless playback) ----------
+
+class SupertonicEngine:
+    """Supertonic (66M flow matching, ONNX): the naturalness of a modern
+    model at 2.1x real-time on this CPU with 8 steps — comfortably above the
+    1x knife edge that sank Kokoro. Fewer steps double the speed but audibly
+    degrade the M3 voice (M1 tolerates 4 steps if speed is ever needed)."""
+
+    sample_rate = 44100
+
+    def __init__(self, voice_name=SUPERTONIC_VOICE):
+        from supertonic import TTS  # deferred: see _load_sdk note
+        self.tts = TTS(auto_download=False)
+        self.style = self.tts.get_voice_style(voice_name=voice_name)
+
+    def synthesize(self, text):
+        wav, _durations = self.tts.synthesize(
+            text=text, voice_style=self.style, lang="en",
+            total_steps=SUPERTONIC_STEPS, speed=SUPERTONIC_SPEED,
+        )
+        return np.ascontiguousarray(wav[0], dtype=np.float32)
+
+
+class PiperEngine:
+    """Piper (VITS): a step below Kokoro in naturalness, but ~7x real-time
+    on this CPU — speech never falls behind the response."""
+
+    def __init__(self, voice_name=PIPER_DEFAULT_VOICE):
+        from piper import PiperVoice, SynthesisConfig  # deferred: see _load_sdk note
+        model_path = os.path.join(MODELS_DIR, f"{voice_name}.onnx")
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(
+                f"Piper voice '{voice_name}' not found. Download it with:\n"
+                f"  python -m piper.download_voices {voice_name} "
+                f"--download-dir \"{MODELS_DIR}\""
+            )
+        self.voice = PiperVoice.load(model_path)
+        self.sample_rate = self.voice.config.sample_rate
+        self.syn_config = SynthesisConfig(length_scale=PIPER_LENGTH_SCALE)
+
+    def synthesize(self, text):
+        chunks = [
+            c.audio_int16_array
+            for c in self.voice.synthesize(text, syn_config=self.syn_config)
+        ]
+        if not chunks:
+            return np.zeros(0, dtype=np.float32)
+        return np.concatenate(chunks).astype(np.float32) / 32768.0
+
+
+class KokoroEngine:
+    """Kokoro via ONNX with misaki phonemization (the G2P it was trained
+    with — kokoro-onnx's default espeak path audibly degrades pronunciation).
+    The most natural voice, but only ~1x real-time on this CPU, so it can
+    fall behind on long responses. Imports are lazy so the default piper
+    startup doesn't pay for spacy/misaki."""
+
+    sample_rate = 24000
+
+    def __init__(self):
+        from kokoro_onnx import Kokoro
+        from misaki import en as misaki_en, espeak as misaki_espeak
+
+        self.tts = Kokoro(KOKORO_MODEL_FILE, KOKORO_VOICES_FILE)
+        self.g2p = misaki_en.G2P(
+            trf=False, british=False,
+            fallback=misaki_espeak.EspeakFallback(british=False),
+        )
+
+    def synthesize(self, text):
+        phonemes, _tokens = self.g2p(text)
+        # trim=False keeps Kokoro's natural leading/trailing silence — it
+        # doubles as slack for the next synthesis
+        samples, _rate = self.tts.create(
+            phonemes, voice=TTS_VOICE, speed=1.0, lang="en-us",
+            is_phonemes=True, trim=False,
+        )
+        return np.ascontiguousarray(samples, dtype=np.float32)
+
+
+class Speaker:
+    """Background TTS. Callers queue text with say() and return immediately.
+    Synthesis and playback run on separate threads: while one sentence is
+    playing, the next is already being synthesized, so slow synthesis doesn't
+    open gaps between sentences (playback blocks in stream.write, and a shared
+    thread would stall synthesis for that whole duration).
+
+    Text is phonemized with misaki (the G2P Kokoro was trained with) and the
+    phonemes are fed to the ONNX engine — espeak phonemization, kokoro-onnx's
+    default, audibly degrades pronunciation.
+
+    Utterances are tagged with an epoch; interrupt() bumps the epoch, so
+    stale audio is dropped and playback stops within one chunk (~0.2s)."""
+
+    _END = object()  # audio-queue marker: one queued utterance finished
+    PLAYBACK_CHUNK = 4800  # 0.2s at 24kHz: bounds barge-in latency
+    MAX_BATCH_CHARS = 240  # cap merged synthesis so barge-in stays responsive
+
+    def __init__(self, engine):
+        self.engine = engine
+        self.text_queue = queue.Queue()
+        self.audio_queue = queue.Queue()
+        self._pending = 0
+        self._audio_backlog = 0  # audio arrays synthesized but not yet played out
+        self._epoch = 0
+        self._cv = threading.Condition()
+        self.stream = sd.OutputStream(
+            samplerate=engine.sample_rate, channels=1, dtype="float32"
+        )
+        self.stream.start()
+        threading.Thread(target=self._synth_worker, daemon=True).start()
+        threading.Thread(target=self._playback_worker, daemon=True).start()
+
+    def say(self, text):
+        text = text.strip()
+        if not text:
+            return
+        with self._cv:
+            self._pending += 1
+            epoch = self._epoch
+        self.text_queue.put((epoch, text))
+
+    def wait_until_done(self):
+        """Block until everything queued so far has been spoken. Waits in
+        short slices: on Windows an open-ended Condition.wait can't be
+        interrupted, so Ctrl+C during speech would otherwise hang until
+        the speech finished."""
+        with self._cv:
+            while self._pending:
+                self._cv.wait(timeout=0.2)
+
+    def wait_or_interrupt(self, key=PUSH_TO_TALK_KEY):
+        """Block until speech finishes, or until the push-to-talk key cuts
+        it off. Returns True if the user barged in (the key is still held,
+        so a recording can start immediately)."""
+        while True:
+            with self._cv:
+                if not self._pending:
+                    return False
+            if keyboard.is_pressed(key):
+                self.interrupt()
+                return True
+            time.sleep(0.02)
+
+    def interrupt(self):
+        """Stop speaking now: unqueued text is dropped, in-flight audio is
+        discarded, playback halts within one chunk."""
+        with self._cv:
+            self._epoch += 1
+        while True:
+            try:
+                self.text_queue.get_nowait()
+            except queue.Empty:
+                break
+            with self._cv:
+                self._pending -= 1
+                if self._pending == 0:
+                    self._cv.notify_all()
+
+    def _current_epoch(self):
+        with self._cv:
+            return self._epoch
+
+    def _synth_worker(self):
+        while True:
+            epoch, text = self.text_queue.get()
+            # Merge whatever is already queued into one synthesis call: each
+            # call costs ~0.5s of fixed overhead, and on this CPU a short
+            # sentence alone synthesizes slower than it plays back, so
+            # per-sentence calls open gaps. Only merge while earlier audio is
+            # still playing to cover the longer synthesis — when nothing is
+            # playing (start of a response), go solo so first words come fast.
+            batched = 1
+            while len(text) < self.MAX_BATCH_CHARS and self._has_audio_backlog():
+                try:
+                    next_epoch, next_text = self.text_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if next_epoch != epoch:
+                    self.text_queue.put((next_epoch, next_text))
+                    break
+                text = f"{text} {next_text}"
+                batched += 1
+            if epoch == self._current_epoch():
+                try:
+                    samples = self.engine.synthesize(text)
+                    with self._cv:
+                        self._audio_backlog += 1
+                    self.audio_queue.put((epoch, samples, text))
+                except Exception as e:
+                    print(f"(TTS error: {e})")
+            for _ in range(batched):
+                self.audio_queue.put((epoch, self._END, None))
+
+    def _has_audio_backlog(self):
+        with self._cv:
+            return self._audio_backlog > 0
+
+    def _playback_worker(self):
+        while True:
+            epoch, audio, text = self.audio_queue.get()
+            if audio is self._END:
+                # Fires for spoken, discarded, and failed utterances alike,
+                # so _pending always returns to zero.
+                with self._cv:
+                    self._pending -= 1
+                    if self._pending == 0:
+                        self._cv.notify_all()
+                continue
+            if text and epoch == self._current_epoch():
+                # Live subtitle: what's playing right now, not a transcript
+                shown = text if len(text) <= 62 else text[:61] + "…"
+                status(f"{SUB_MARK} {dim(shown)}")
+            try:
+                for i in range(0, len(audio), self.PLAYBACK_CHUNK):
+                    if epoch != self._current_epoch():
+                        break
+                    self.stream.write(audio[i:i + self.PLAYBACK_CHUNK])
+            except Exception as e:
+                print(f"(audio playback error: {e})")
+            finally:
+                with self._cv:
+                    self._audio_backlog -= 1
+
+
+# ---------- Permission callback (auto-approve reads, ask before writes) ----------
+
+READ_ONLY_TOOLS = {"Read", "Glob", "Grep"}
+READ_ONLY_BASH_PREFIXES = (
+    "ls", "dir", "cat", "type", "git status", "git log",
+    "git diff", "git branch", "pwd", "echo",
+)
+
+
+# Chaining/redirection operators let a "read-only" prefix smuggle in writes
+# (e.g. "cat x; rm -rf ." or "echo hi > file"), so their presence disqualifies
+# a command from auto-approval regardless of how it starts.
+BASH_UNSAFE_PATTERN = re.compile(r"[;&|><`\n]|\$\(")
+
+
+def is_read_only_bash(command):
+    if BASH_UNSAFE_PATTERN.search(command):
+        return False
+    command = command.strip().lower()
+    return any(command.startswith(prefix) for prefix in READ_ONLY_BASH_PREFIXES)
+
+
+def _short_path(path):
+    parts = re.split(r"[\\/]", str(path))
+    return "/".join(parts[-2:]) if len(parts) > 1 else str(path)
+
+
+def describe_tool_use(name, tool_input):
+    """One dim scrollback line per tool call — the 'work happening' feed."""
+    if name == "Read":
+        return f"read {_short_path(tool_input.get('file_path', '?'))}"
+    if name == "Edit":
+        return f"edit {_short_path(tool_input.get('file_path', '?'))}"
+    if name == "Write":
+        return f"write {_short_path(tool_input.get('file_path', '?'))}"
+    if name == "Glob":
+        return f"glob {tool_input.get('pattern', '?')}"
+    if name == "Grep":
+        return f'grep "{tool_input.get("pattern", "?")}"'
+    if name == "Bash":
+        command = str(tool_input.get("command", "?"))
+        return f"run: {command if len(command) <= 56 else command[:55] + '…'}"
+    if name == "Task":
+        detail = str(tool_input.get("description", "") or tool_input.get("prompt", ""))
+        return f"agent: {detail[:56]}"
+    return name.lower()
+
+
+def describe_action(tool_name, tool_input):
+    if tool_name == "Edit":
+        return f"edit the file {tool_input.get('file_path', 'unknown file')}"
+    if tool_name == "Write":
+        return f"write to the file {tool_input.get('file_path', 'unknown file')}"
+    if tool_name == "Bash":
+        return f"run the command: {tool_input.get('command', 'unknown command')}"
+    return f"use the tool {tool_name}"
+
+
+async def voice_permission_callback(tool_name, tool_input, context):
+    global _approval_active, _task_approval
+
+    if tool_name in READ_ONLY_TOOLS:
+        return PermissionResultAllow()
+
+    if tool_name == "Bash" and is_read_only_bash(tool_input.get("command", "")):
+        return PermissionResultAllow()
+
+    # --readonly: a hard no for anything that changes state, regardless of
+    # approvals — for exploring repos that must not be touched.
+    if readonly_mode and tool_name in ("Edit", "Write", "Bash"):
+        return PermissionResultDeny(message=(
+            "This session is read-only: edits and commands are disabled. "
+            "Explain or show code instead of changing anything."
+        ))
+
+    # No git, no edits: without a checkpoint to revert to, a bad edit by
+    # voice is unrecoverable. Claude relays this to the user out loud.
+    if tool_name in ("Edit", "Write") and not git_safety.enabled:
+        return PermissionResultDeny(message=(
+            "Edits are disabled: this folder is not a git repository, so "
+            "there is no safety net to undo changes. Tell the user that "
+            "running git init in this folder enables editing."
+        ))
+
+    # "Yes, for the whole task" covers remaining edits this turn. Bash never
+    # auto-approves — commands are where the unrecoverable sharp edges are.
+    if tool_name in ("Edit", "Write") and _task_approval:
+        git_safety.before_mutation(tool_name, tool_input)
+        return PermissionResultAllow()
+
+    # Needs voice approval. The flag pauses the barge-in watcher (holding
+    # the key here means "answering", not "cut Claude off"), and the blocking
+    # calls run in threads so the SDK's control protocol stays responsive
+    # while we talk and listen.
+    _approval_active = True
+    try:
+        stop_thinking()
+        description = describe_action(tool_name, tool_input)
+        print(f"\n\n  {yellow('! approval needed')} — Mabara wants to {description}")
+        speaker.say(speakable(f"I'd like to {description}. Do you approve?"))
+        await asyncio.to_thread(speaker.wait_until_done)
+
+        audio = await asyncio.to_thread(
+            recorder.record_while_held, f"hold {PTT_LABEL} to answer (yes / no)"
+        )
+        if audio is None:
+            clear_status()
+            print(f"  {dim('no answer — denied')}\n")
+            return PermissionResultDeny(message="No response captured")
+
+        answer = (await asyncio.to_thread(stt.transcribe, audio)).lower()
+        clear_status()
+        print(f"  {cyan('You »')} {answer.strip()}")
+
+        if any(word in answer for word in ["yes", "yeah", "sure", "go ahead", "okay", "ok"]):
+            git_safety.before_mutation(tool_name, tool_input)
+            # "yes for the whole task" / "yes to all" widens the grant to
+            # every remaining edit in this task
+            if any(word in answer for word in ["task", "everything", "all"]):
+                _task_approval = True
+                print(f"  {green('approved')} {dim('— and auto-approving edits for the rest of this task')}\n")
+                speaker.say("Okay — I'll handle the rest of this task's edits without asking.")
+            else:
+                print(f"  {green('approved')}\n")
+                speaker.say("Okay, doing it now.")
+            return PermissionResultAllow()
+        else:
+            print(f"  {dim('denied')}\n")
+            speaker.say("Okay, I won't do that.")
+            return PermissionResultDeny(message="User declined via voice")
+    finally:
+        _approval_active = False
+        start_thinking()
+
+
+# ---------- Async helper (Claude conversation) ----------
+
+def get_message_session_id(message):
+    """The session ID isn't exposed on the client object; it arrives in the
+    message stream (ResultMessage.session_id, and the init SystemMessage's
+    data dict)."""
+    session_id = getattr(message, "session_id", None)
+    if session_id:
+        return session_id
+    data = getattr(message, "data", None)
+    if isinstance(data, dict):
+        return data.get("session_id")
+    return None
+
+
+CODE_OPEN = "[CODE]"
+CODE_CLOSE = "[/CODE]"
+SENTENCE_BOUNDARY = re.compile(r"(?<=[.!?])\s+")
+
+
+class SentenceStreamer:
+    """Accumulates streamed text, hands complete sentences to the speaker as
+    they arrive, and diverts [CODE]...[/CODE] blocks to the terminal.
+
+    A tag split across deltas (e.g. a buffer ending in '[CO') is safe: text
+    is only spoken up to a sentence boundary, and a tag fragment contains no
+    sentence-ending punctuation, so it stays buffered until the rest arrives."""
+
+    def __init__(self, speaker):
+        self.speaker = speaker
+        self.buffer = ""
+        self.in_code = False
+        self.code_count = 0
+        self.sentence_count = 0
+        self._transcript = []
+
+    def feed(self, text):
+        self.buffer += text
+        self._drain(final=False)
+
+    def flush(self):
+        """Speak whatever is buffered even without a trailing sentence break.
+        Called when a text block ends: a sentence that closes a block has no
+        following whitespace, so it would otherwise sit unspoken until the
+        next block (e.g. an acknowledgment before a long tool-use phase)."""
+        if not self.in_code:
+            self._drain(final=True)
+
+    def finish(self):
+        self._drain(final=True)
+
+    def _drain(self, final):
+        while True:
+            if self.in_code:
+                idx = self.buffer.find(CODE_CLOSE)
+                if idx == -1:
+                    if final and self.buffer.strip():
+                        self._show_code(self.buffer)
+                        self.buffer = ""
+                    return
+                self._show_code(self.buffer[:idx])
+                self.buffer = self.buffer[idx + len(CODE_CLOSE):]
+                self.in_code = False
+            else:
+                idx = self.buffer.find(CODE_OPEN)
+                if idx == -1:
+                    self._speak_complete_sentences(final)
+                    return
+                head = self.buffer[:idx]
+                self.buffer = self.buffer[idx + len(CODE_OPEN):]
+                for part in SENTENCE_BOUNDARY.split(head):
+                    self._say(part)
+                self.in_code = True
+
+    def _speak_complete_sentences(self, final):
+        parts = SENTENCE_BOUNDARY.split(self.buffer)
+        if final:
+            complete, self.buffer = parts, ""
+        else:
+            complete, self.buffer = parts[:-1], parts[-1]
+        for part in complete:
+            self._say(part)
+
+    def _say(self, sentence):
+        sentence = strip_markdown(sentence)
+        if sentence:
+            # Spoken prose stays off the scrollback — the playback subtitle
+            # shows it live and the transcript log keeps it re-readable.
+            # Speech gets path-sanitized; the transcript keeps the original.
+            self.sentence_count += 1
+            self._transcript.append(sentence)
+            self.speaker.say(speakable(sentence))
+
+    def _show_code(self, code):
+        self.code_count += 1
+        self._transcript.append(f"[CODE] {code.strip()} [/CODE]")
+        rule = "-" * 46
+        clear_status()
+        print(f"{dim('--[ code ]' + rule[10:])}")
+        print(code.strip())
+        print(dim(rule))
+
+    def transcript_text(self):
+        return " ".join(self._transcript)
+
+
+def describe_result_error(result_text):
+    """Turn a raw CLI error result into one short spoken sentence."""
+    text = str(result_text or "").strip()
+    if "usage limit" in text.lower() or "rate limit" in text.lower():
+        spoken = ("I've hit the Claude usage limit, so I can't respond right "
+                  "now. Try again after it resets.")
+        # Limit errors often carry the reset time: "...reached|1751628800"
+        match = re.search(r"\|(\d{9,})", text)
+        if match:
+            reset = time.strftime("%I:%M %p", time.localtime(int(match.group(1))))
+            spoken = (f"I've hit the Claude usage limit, so I can't respond "
+                      f"right now. It should reset around {reset}.")
+        return spoken
+    return "Something went wrong getting a response. The details are on your screen."
+
+
+def get_stream_text(message):
+    """Extract the text delta from a StreamEvent, or None for other events."""
+    event = message.event
+    if event.get("type") != "content_block_delta":
+        return None
+    delta = event.get("delta", {})
+    if delta.get("type") != "text_delta":
+        return None
+    return delta.get("text")
+
+
+async def ask_claude(client, text, speaker):
+    """Send text to Claude. Spoken sentences stream to the TTS queue (the
+    playback subtitle shows them live); the scrollback gets only artifacts —
+    tool-action lines, code blocks, approvals. Holding push-to-talk mid-response
+    barges in: speech stops and the model stops generating.
+    Returns (session_id, barged_in, streamer, tool_calls)."""
+    global _task_approval, _first_token_secs
+    _task_approval = False  # a whole-task grant never outlives its task
+    _first_token_secs = None
+    query_started = time.time()
+    await client.query(text)
+    streamer = SentenceStreamer(speaker)
+    session_id = None
+    barged_in = False
+    tool_calls = 0
+    result_error = None
+
+    async def watch_for_barge_in():
+        nonlocal barged_in
+        while True:
+            if not _approval_active and keyboard.is_pressed(PUSH_TO_TALK_KEY):
+                barged_in = True
+                speaker.interrupt()
+                try:
+                    await client.interrupt()
+                except Exception:
+                    pass  # response may already be finishing; nothing to stop
+                return
+            await asyncio.sleep(0.05)
+
+    watcher = asyncio.create_task(watch_for_barge_in())
+    start_thinking()
+    try:
+        async for message in client.receive_response():
+            session_id = get_message_session_id(message) or session_id
+            # In-band failures (usage limit, API errors) don't raise — they
+            # arrive as an error-flagged result with no spoken text at all,
+            # which would otherwise be pure silence.
+            if getattr(message, "is_error", False):
+                result_error = getattr(message, "result", None) or "unknown error"
+            if barged_in:
+                continue  # drain quietly until the stream closes
+            # Speak only from raw deltas; complete AssistantMessages repeat
+            # the same text and would double-speak it.
+            if isinstance(message, StreamEvent) and message.parent_tool_use_id is None:
+                if message.event.get("type") == "content_block_stop":
+                    streamer.flush()
+                chunk = get_stream_text(message)
+                if chunk:
+                    if _first_token_secs is None:
+                        _first_token_secs = time.time() - query_started
+                    # Clears the "thinking..." line (restarts after approvals)
+                    stop_thinking()
+                    streamer.feed(chunk)
+            elif hasattr(message, "content") and isinstance(message.content, list):
+                # Complete AssistantMessages carry the tool calls — one dim
+                # line each is what makes the terminal read like work
+                for block in message.content:
+                    if hasattr(block, "name") and hasattr(block, "input"):
+                        clear_status()
+                        print(f"  {dim(f'{TOOL_MARK} {describe_tool_use(block.name, block.input)}')}")
+                        tool_calls += 1
+    finally:
+        watcher.cancel()
+        stop_thinking()
+        _task_approval = False
+    if not barged_in:
+        streamer.finish()
+    else:
+        print(f"  {dim('(you cut in — go ahead)')}")
+    if result_error and not barged_in:
+        clear_status()
+        shown = str(result_error).strip()
+        print(f"\n  {red('!')} {shown if len(shown) <= 300 else shown[:300] + '…'}")
+        append_transcript("Error", shown)
+        speaker.say(describe_result_error(result_error))
+    return session_id, barged_in, streamer, tool_calls, result_error
+
+
+# ---------- Loading screen ----------
+
+MASCOT = r"""
+  __  __     _     ___     _     ___     _
+ |  \/  |   /_\   | _ )   /_\   | _ \   /_\
+ | |\/| |  / _ \  | _ \  / _ \  |   /  / _ \
+ |_|  |_| /_/ \_\ |___/ /_/ \_\ |_|_\ /_/ \_\
+"""
+
+TAGLINE = "           Code at the speed of speech"
+
+
+def animate_banner():
+    """Sweep the logo in left-to-right (like a waveform being drawn), then
+    type the tagline out as if spoken. ~0.6s total. Falls back to a static
+    print when stdout isn't a terminal, or when the window is too narrow
+    for the art — wrapped lines would break the cursor-up redraw math."""
+    art = MASCOT.strip("\n").split("\n")
+    width = max(len(line) for line in art)
+    if not _USE_COLOR or shutil.get_terminal_size().columns <= width:
+        print(MASCOT)
+        print(dim(TAGLINE) + "\n")
+        return
+
+    out = sys.stdout
+    out.write("\033[?25l")  # hide the cursor; redraws flicker with it visible
+    try:
+        out.write("\n" * (len(art) + 1))  # blank line + reserved art rows
+        prev = 0
+        for col in range(2, width + 2, 2):
+            out.write(f"\033[{len(art)}F")  # back to the first art row
+            for line in art:
+                seg = line[prev:col]  # only the newly revealed columns —
+                if seg:               # never rewrite cells already on screen
+                    if prev:
+                        out.write(f"\033[{prev}C")
+                    out.write(seg)
+                out.write("\n")
+            out.flush()
+            time.sleep(0.012)
+            prev = col
+
+        out.write("\n")
+        indent = len(TAGLINE) - len(TAGLINE.lstrip())
+        out.write(TAGLINE[:indent])
+        for ch in TAGLINE[indent:]:
+            out.write(dim(ch))
+            out.flush()
+            if ch != " ":
+                time.sleep(0.012)
+        out.write("\n\n")
+    finally:
+        out.write("\033[?25h")
+        out.flush()
+
+
+# The spinner walks through these in order and holds on the last one —
+# looping back to "tuning my ears" on a slow load reads as being stuck.
+LOADING_PHASES = [
+    "tuning my ears...",
+    "warming up my voice...",
+    "waking up Claude...",
+    "loading the last few neurons...",
+    "almost there...",
+]
+
+# One tip per launch, picked at random and left on screen. (These used to
+# rotate through the spinner at 2.5s each — too fast to actually read, and
+# they competed with the progress messages.)
+TIPS = [
+    f"hold {PTT_LABEL} for your whole sentence — release to send",
+    f"I talk too much? hold {PTT_LABEL} to cut me off and take over",
+    "I never edit or run anything until you say yes out loud",
+    "answer 'yes for the whole task' to approve all its edits at once",
+    "said yes and regret it? just say 'revert that'",
+    "happy with a task? say 'commit this' to make it a git commit",
+    "say 'switch to sonnet' for hard tasks, 'switch to haiku' for speed",
+    "everything we say lands in transcripts.log",
+    "each repo gets its own conversation — resume anytime",
+]
+
+# Spoken the moment Mabara is ready: the voice is the product, so the first
+# proof it works shouldn't wait for the first task — and if the speakers are
+# muted or routed wrong, the user finds out now, not mid-conversation.
+GREETINGS = [
+    "Ready when you are.",
+    "I'm listening.",
+    "What are we building today?",
+]
+GREETING_RESUME = "Welcome back. Where were we?"
+
+
+class Ticker:
+    """Animated one-line status for waits we can't shorten (model loading,
+    the Claude CLI handshake, silent thinking/tool phases)."""
+
+    def __init__(self, messages):
+        self.messages = messages
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        frames = "|/-\\"
+        i = 0
+        while not self._stop_event.is_set():
+            # Advance through the messages, then hold on the last one
+            msg = self.messages[min(i // 10, len(self.messages) - 1)]
+            status(f"{frames[i % 4]} {dim(msg)}")
+            i += 1
+            time.sleep(0.25)
+
+    def stop(self):
+        self._stop_event.set()
+        self._thread.join()
+        clear_status()
+
+
+# One shared "thinking..." ticker for silent stretches while Claude works.
+# ask_claude starts it; the first streamed words or an approval request
+# stop it (whichever comes first).
+_thinking = None
+
+
+def start_thinking():
+    global _thinking
+    if _thinking is None:
+        _thinking = Ticker(["thinking..."])
+
+
+def stop_thinking():
+    global _thinking
+    if _thinking is not None:
+        _thinking.stop()
+        _thinking = None
+
+
+# ---------- Main loop ----------
+
+async def main():
+    global stt, speaker, recorder, session_saved, git_safety, readonly_mode
+
+    args = parse_args()
+    repo_path = os.path.abspath(args.repo)
+
+    def load_stt():
+        _load_audio()  # np is used below (and throughout the engines)
+        engine = ParakeetSTT() if args.stt == "parakeet" else WhisperSTT(args.stt)
+        # Warm-up: lazily-initialized state (VAD model, decode kernels) would
+        # otherwise delay the first real utterance.
+        engine.transcribe(np.zeros(SAMPLERATE // 2, dtype=np.float32))
+        return engine
+
+    def load_tts():
+        _load_audio()  # the engines' synthesize() paths use np
+        if args.tts == "supertonic":
+            engine = SupertonicEngine()
+        elif args.tts == "piper":
+            engine = PiperEngine(args.voice)
+        else:
+            engine = KokoroEngine()
+        # Warm-up: the first inference initializes ONNX session state that
+        # would otherwise delay the first reply.
+        engine.synthesize("Warm up.")
+        return engine
+
+    # Everything slow — the models, the agent SDK import, and the git
+    # subprocess spawns (which crawl while the loader threads peg the CPU) —
+    # loads in background threads while the banner draws and the user
+    # reads/answers. Yield once so the threads actually start before the
+    # animation's sleeps and the blocking input() freeze the event loop.
+    stt_task = asyncio.create_task(asyncio.to_thread(load_stt))
+    tts_task = asyncio.create_task(asyncio.to_thread(load_tts))
+    sdk_task = asyncio.create_task(asyncio.to_thread(_load_sdk))
+    git_task = asyncio.create_task(asyncio.to_thread(GitSafety, repo_path))
+    await asyncio.sleep(0)
+
+    # Identity first: the banner is the first thing on screen, then context,
+    # then (only if relevant) the one question we have — which doubles as
+    # useful reading time while the models load behind it.
+    animate_banner()
+
+    readonly_mode = args.readonly
+    globals()["debug_mode"] = args.debug
+
+    print(f"  {dim('model')} {args.model}   {dim('repo')} {repo_path}")
+    print(f"  {dim('spoken transcript')} {dim(TRANSCRIPT_FILE)}")
+    git_safety = await git_task
+    if args.readonly:
+        print(f"  {yellow('read-only')} {dim('— edits and commands are disabled this session')}")
+    elif not git_safety.enabled:
+        print(f"  {yellow('!')} {dim('not a git repository — edits disabled, exploring only (git init to enable)')}")
+    elif git_safety.dirty:
+        print(f"  {dim('heads up: uncommitted changes in this repo — consider committing before edit tasks')}")
+    print()
+
+    sessions = load_sessions()
+    existing_session = sessions.get(repo_path)
+    resume_id = None
+    if existing_session:
+        if prompt_resume(existing_session):
+            resume_id = existing_session
+        print()
+
+    print(f"  {dim('tip: ' + random.choice(TIPS))}")
+    print()
+
+    ticker = Ticker(LOADING_PHASES)
+    try:
+        await sdk_task  # the names below don't exist until the import lands
+    except BaseException:
+        ticker.stop()  # same as below: keep the spinner off the traceback
+        raise
+
+    options = ClaudeAgentOptions(
+        cwd=repo_path,
+        model=args.model,
+        allowed_tools=["Read", "Glob", "Grep"],
+        # Subagents are poison for a real-time voice loop: Task is
+        # auto-approved by the CLI (bypassing voice approval), runs cold and
+        # slow, and background agents finish between turns where nobody is
+        # listening ("still waiting on that agent..."). Haiku especially
+        # loves delegating trivial lookups to them.
+        disallowed_tools=["Task"],
+        can_use_tool=voice_permission_callback,
+        resume=resume_id,
+        include_partial_messages=True,
+        system_prompt=(
+            "You are Mabara, a voice-driven coding agent working directly in "
+            "the user's codebase. The user speaks to you and hears your "
+            "replies read aloud by a text-to-speech engine — they are "
+            "listening, not reading. You can explore the code freely; edits "
+            "and commands go through a spoken approval step where the user "
+            "answers yes or no out loud.\n\n"
+            "How to speak: plain, natural, flowing sentences, like a capable "
+            "colleague talking while they work. Never use markdown, bullet "
+            "points, headers, bold, or tables — instead of a list, say "
+            "'first... second... and third...'. Answer questions at whatever "
+            "length they deserve; narrate work tersely. Refer to files by "
+            "their short name out loud ('page.tsx' or 'the chat route'), "
+            "never a full path — exact paths belong in [CODE] tags.\n\n"
+            "The ONLY exception is literal code: when exact code, a file "
+            "path, or a diff genuinely matters, wrap ONLY that part in [CODE] "
+            "and [/CODE] tags — it is shown on the user's screen, not spoken. "
+            "Say out loud that you've put it on the screen; never read code "
+            "aloud symbol by symbol. Keep [CODE] blocks minimal.\n\n"
+            "How to work: before any tool use, say one short sentence about "
+            "what you're about to do — never start with silent tool use; the "
+            "user is sitting in silence and can't see your tools running. "
+            "During multi-step tasks, narrate each significant step in a "
+            "sentence ('Found it — the default is wrong in parse_args. "
+            "Fixing it now.'). Before requesting an edit or a command, state "
+            "the reason in one sentence first, so the yes-or-no approval "
+            "question that follows makes sense to someone who can't see the "
+            "change. For work spanning several files, say the plan out loud "
+            "in a sentence or two before you start, and mention that they "
+            "can approve edits one by one or say 'yes for the whole task' "
+            "to approve them all at once. Always do the work yourself with "
+            "your own tools, in this turn — never launch agents or "
+            "background tasks: the user is on a live voice call with you "
+            "and anything that finishes 'later' finishes never.\n\n"
+            "Accuracy discipline: never state facts about the codebase — "
+            "its stack, dependencies, structure, or behavior — from memory, "
+            "docs, or notes alone. Documentation describes intentions; the "
+            "code is the truth. For a stack or dependency question, read "
+            "the actual manifests (package.json, requirements.txt, configs) "
+            "before answering, every session. If you haven't verified "
+            "something, say so plainly instead of sounding sure.\n\n"
+            "After changing code: say plainly what changed and where, put "
+            "the key changed lines on screen in [CODE] tags when the exact "
+            "code matters, and end with how to verify — offer to run the "
+            "tests or the app rather than doing it unasked. If something you "
+            "tried didn't work, say so directly and what you're trying "
+            "instead. When the user asks you to explain or teach, shift into "
+            "full tutor mode: unhurried, thorough, spoken explanation."
+            + (f"\n\nYou start this session as the '{args.model}' model. The "
+               "user can switch models by voice at any time: 'switch to "
+               "haiku' trades depth for speed and a lighter usage quota, "
+               "'switch to sonnet' restores full reasoning. If you are the "
+               "fast model and a request clearly needs heavy multi-file "
+               "engineering, suggest switching back in one sentence before "
+               "starting.")
+            + ("\n\nThis session is READ-ONLY: file edits and shell commands "
+               "are disabled. Never offer to make changes — explain, review, "
+               "and point at exact code instead."
+               if args.readonly else "")
+        ),
+    )
+
+    try:
+        async with ClaudeSDKClient(options=options) as client:
+            stt = await stt_task
+            speaker = Speaker(await tts_task)
+            recorder = Recorder()
+            ticker.stop()
+            saved_session_id = None
+            pending_note = ""
+
+            print(f"  {green(DOT)} ready {dim(f'· hold {PTT_LABEL} to talk · Ctrl+C to quit')}\n")
+            # The first sound of the session: proof the whole voice pipeline
+            # is live before the user commits words to it. Interruptible like
+            # any other speech — holding push-to-talk cuts straight to talking.
+            greeting = GREETING_RESUME if resume_id else random.choice(GREETINGS)
+            append_transcript("Mabara", greeting)
+            speaker.say(greeting)
+            speaker.wait_or_interrupt()
+            while True:
+                audio = recorder.record_while_held()
+                if audio is None:
+                    continue
+                # A quick tap records only the pre-roll; too short to hold speech
+                if len(audio) < int(0.4 * SAMPLERATE):
+                    clear_status()
+                    print(f"  {dim(f'(just a tap — hold {PTT_LABEL} down while you speak)')}")
+                    continue
+
+                t_stt = time.time()
+                text = stt.transcribe(audio)
+                stt_secs = time.time() - t_stt
+                clear_status()
+                if not text.strip():
+                    print(f"  {dim('(heard nothing — try again)')}")
+                    continue
+                # Blank line gives each exchange its own visual block
+                print(f"\n  {cyan('You »')} {text.strip()}")
+
+                append_transcript("You", text.strip())
+
+                # 'Revert that' is handled locally with git — deterministic,
+                # instant, and no model in the loop for the undo itself.
+                if is_revert_command(text):
+                    summary = git_safety.revert()
+                    print(f"  {green(CHECK)} {dim(summary)}")
+                    append_transcript("Mabara", summary)
+                    speaker.say(summary)
+                    speaker.wait_until_done()
+                    # Keep Claude's picture of the code truthful on the
+                    # next turn without burning a turn now
+                    pending_note = ("[Note: the user reverted your previous "
+                                    "file changes with git; those files are "
+                                    "back to their pre-task state.] ")
+                    continue
+
+                # 'Commit this' graduates the last task's changes into a real
+                # commit — drafted locally, approved by voice.
+                if is_commit_command(text):
+                    preview = git_safety.commit_preview()
+                    if preview is None:
+                        note = ("This folder isn't a git repository."
+                                if not git_safety.enabled
+                                else "There are no task changes to commit.")
+                        print(f"  {dim(note)}")
+                        speaker.say(note)
+                        speaker.wait_until_done()
+                        continue
+                    paths, subject = preview
+                    names = ", ".join(os.path.basename(p) for p in paths[:4])
+                    if len(paths) > 4:
+                        names += f" and {len(paths) - 4} more"
+                    file_word = "file" if len(paths) == 1 else "files"
+                    print(f"  {yellow('! commit')} — {len(paths)} {file_word}: {names}")
+                    print(f"  {dim('message: ' + subject)}")
+                    speaker.say(speakable(
+                        f"I'll commit {names} with the message: {subject}. Do you approve?"
+                    ))
+                    speaker.wait_until_done()
+                    audio = recorder.record_while_held(f"hold {PTT_LABEL} to answer (yes / no)")
+                    answer = stt.transcribe(audio).lower() if audio is not None else ""
+                    clear_status()
+                    print(f"  {cyan('You »')} {answer.strip() or '(no answer)'}")
+                    if any(w in answer for w in ["yes", "yeah", "sure", "go ahead", "okay", "ok"]):
+                        outcome = git_safety.commit(subject)
+                        print(f"  {green(CHECK)} {dim(outcome)}")
+                        speaker.say(outcome)
+                        pending_note = ("[Note: the user committed your recent "
+                                        f"file changes to git as: {subject}.] ")
+                    else:
+                        print(f"  {dim('not committing')}")
+                        speaker.say("Okay, I won't commit.")
+                    speaker.wait_until_done()
+                    append_transcript("Mabara", f"(commit flow) {subject}")
+                    continue
+
+                # 'Switch to sonnet/haiku' swaps the model mid-session —
+                # same conversation, no cold start; pay for the big brain
+                # only while it's engineering.
+                target = model_switch_target(text)
+                if target:
+                    try:
+                        await client.set_model(target)
+                        print(f"  {green(CHECK)} {dim('model switched to ' + target)}")
+                        speaker.say(f"Okay — {target} is driving now.")
+                        pending_note = (f"[Note: the user switched you to the "
+                                        f"{target} model just now.] ")
+                    except Exception as e:
+                        print(f"  {red('!')} couldn't switch model: {e}")
+                        speaker.say("Sorry, the model switch didn't work.")
+                    speaker.wait_until_done()
+                    continue
+
+                git_safety.begin_turn(text)
+                try:
+                    session_id, interrupted, streamer, tool_calls, had_error = \
+                        await ask_claude(client, pending_note + text, speaker)
+                    pending_note = ""
+                except (KeyboardInterrupt, asyncio.CancelledError):
+                    raise
+                except Exception as e:
+                    # A failed turn (network blip, CLI hiccup) shouldn't kill
+                    # the session — report it and keep listening.
+                    stop_thinking()
+                    clear_status()
+                    print(f"\n  {red('!')} something went wrong: {e}")
+                    print(f"  {dim('(try asking again)')}")
+                    speaker.say("Sorry, something went wrong. Please try again.")
+                    speaker.wait_until_done()
+                    continue
+
+                append_transcript("Mabara", streamer.transcript_text())
+                if session_id and session_id != saved_session_id:
+                    save_session(repo_path, session_id)
+                    saved_session_id = session_id
+                    session_saved = True
+                # Speech plays out; holding push-to-talk cuts it off to talk again.
+                if not interrupted and speaker.wait_or_interrupt():
+                    print(f"  {dim('(you cut in — go ahead)')}")
+                    interrupted = True
+                if not interrupted and not had_error:
+                    summary = f"spoke {streamer.sentence_count} sentence" \
+                              + ("s" if streamer.sentence_count != 1 else "")
+                    if tool_calls:
+                        summary += f" · {tool_calls} tool call" + ("s" if tool_calls != 1 else "")
+                    clear_status()
+                    print(f"  {green(CHECK)} {dim(summary)}")
+                first_token = (f"{_first_token_secs:.1f}s"
+                               if _first_token_secs is not None else "n/a")
+                append_transcript("Debug", f"stt={stt_secs:.1f}s first_token={first_token}")
+                if debug_mode:
+                    print(f"  {dim(f'(debug: transcribe {stt_secs:.1f}s · claude first token {first_token})')}")
+    except BaseException:
+        # Connect failed or Ctrl+C mid-startup: clear the spinner line so it
+        # doesn't mangle the traceback / goodbye message.
+        ticker.stop()
+        raise
+
+
+def _farewell_and_exit(signum=None, frame=None):
+    """Exit on the FIRST Ctrl+C. Letting asyncio unwind normally waits on
+    the SDK subprocess teardown, which used to demand a second Ctrl+C.
+    There's nothing to flush: sessions and transcripts are saved per turn."""
+    stop_thinking()
+    clear_status()
+    farewell = "\n  Goodbye."
+    if session_saved:
+        farewell += dim("  (this conversation will resume next launch)")
+    print(farewell, flush=True)
+    os._exit(0)
+
+
+if __name__ == "__main__":
+    signal.signal(signal.SIGINT, _farewell_and_exit)
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        # Fallback if the interrupt arrives before/around the handler setup
+        _farewell_and_exit()

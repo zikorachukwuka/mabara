@@ -1,0 +1,13 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Model weights — hundreds of MB; downloaded on setup (see README)
+models/
+
+# Runtime state — private: conversation transcripts and session IDs
+data/
+
+# Voice recordings — contain the developer's actual voice
+tests/*.wav
