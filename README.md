@@ -100,13 +100,13 @@ Distil-Whisper's headline speedups never materialized for push-to-talk: short cl
 | Kokoro (fp32 ONNX + misaki G2P) | 1.6× | still knife-edge; gaps between sentences |
 | Kokoro (**int8** ONNX) | **0.6×** | *slower* than fp32 — this CPU has no VNNI |
 | Supertonic M1 (66M flow matching) | 2.1–4.2× | near-Kokoro quality, but ~1.6s to first word |
-| **Piper joe-medium** | **~7×** | robotic edge, **0.4s to first word** — wins |
+| **Piper joe-medium** | **~7×** | robotic edge, **0.4s to first word** - wins |
 
-Two findings worth stealing: **int8 quantization is a *slowdown* on CPUs without VNNI** (benchmark before you quantize), and **for a conversational agent, response latency beats voice beauty** — I lived with a robotic voice for a day happily, but 1.2 extra seconds of silence before every reply lasted twenty minutes. Supertonic remains available behind `--tts supertonic`.
+Two findings worth stealing: **int8 quantization is a *slowdown* on CPUs without VNNI** (benchmark before you quantize), and **for a conversational agent, response latency beats voice beauty** - I lived with a robotic voice for a day happily, but 1.2 extra seconds of silence before every reply lasted twenty minutes. Supertonic remains available behind `--tts supertonic`.
 
 ### Brain: model economics, measured
 
-Haiku answered ~2s faster and stretches subscription quota — but in live use it delegated trivial questions to background agents (stranding the voice loop) and confidently mis-stated the backend stack from docs without reading the manifests. Both got prompt-level fixes, but the default is **Sonnet: wrong-but-confident is the most expensive output a voice tool can produce.** Haiku stays one spoken sentence away.
+Haiku answered ~2s faster and stretches subscription quota - but in live use it delegated trivial questions to background agents (stranding the voice loop) and confidently mis-stated the backend stack from docs without reading the manifests. Both got prompt-level fixes, but the default is **Sonnet: wrong-but-confident is the most expensive output a voice tool can produce.** Haiku stays one spoken sentence away.
 
 ### Latency budget (release key → first spoken word)
 
@@ -129,7 +129,7 @@ The local pipeline is squeezed to near its physical floor; what remains is the m
 | "commit this" | commit the last task's files (voice-approved message) |
 | "switch to haiku / sonnet / opus" | swap model mid-conversation |
 
-Command matchers are deliberately narrow word-allowlists — "how do I undo a commit?" is conversation, "undo that" is a command.
+Command matchers are deliberately narrow word-allowlists - "how do I undo a commit?" is conversation, "undo that" is a command.
 
 ## Setup
 
@@ -171,10 +171,10 @@ function mabara {
 
 ## Honest limitations
 
-- **Tuned for one machine.** Every default here won a benchmark on *my* laptop. On yours, the losers might win — the flags exist so you can re-run the bake-off. (If your CPU has VNNI, int8 models may actually be fast for you.)
+- **Tuned for one machine.** Every default here won a benchmark on *my* laptop. On yours, the losers might win - the flags exist so you can re-run the bake-off. (If your CPU has VNNI, int8 models may actually be fast for you.)
 - **Windows-first.** The `keyboard` global hotkey and console handling are Windows-tested; Linux/macOS would need small changes.
 - **English-only** speech pipeline (the models have multilingual variants if you're adventurous).
-- Claude usage is billed through your Claude Code subscription/API — Mabara reports usage-limit errors out loud rather than pretending they didn't happen.
+- Claude usage is billed through your Claude Code subscription/API - Mabara reports usage-limit errors out loud rather than pretending they didn't happen.
 
 ## Roadmap
 
@@ -182,8 +182,8 @@ Wake-word activation ("Hey Mabara" instead of push-to-talk) and long-task narrat
 
 ## How it was built
 
-Mabara was pair-built in a single day with Claude Code — the AI wrote most of the lines; every decision was human. Which benchmarks to run, which trade-offs to accept, which defaults to revert (three times, when the measurements disagreed with the hype) — that's the part that can't be delegated, and the decision log above is the receipts.
+Mabara was pair-built over a weekend with Claude Code - the AI wrote most of the lines; every decision was human. Which benchmarks to run, which trade-offs to accept, which defaults to revert (three times, when the measurements disagreed with the hype) - that's the part that can't be delegated, and the decision log above is the receipts.
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT - see [LICENSE](LICENSE).
