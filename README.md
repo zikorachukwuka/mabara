@@ -177,6 +177,10 @@ function mabara {
 
 Wake-word activation ("Hey Mabara" instead of push-to-talk) and long-task narration polish. The safety net (checkpoints, voice approvals, revert/commit) is done and battle-tested.
 
+## How it was built
+
+Mabara was pair-built in a single day with Claude Code — the AI wrote most of the lines; every decision was human. Which benchmarks to run, which trade-offs to accept, which defaults to revert (three times, when the measurements disagreed with the hype) — that's the part that can't be delegated, and the decision log above is the receipts.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
