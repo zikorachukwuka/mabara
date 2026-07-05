@@ -1226,6 +1226,28 @@ def get_stream_text(message):
     return delta.get("text")
 
 
+def is_thinking_delta(message):
+    """True when the model is streaming extended-thinking tokens — activity
+    worth surfacing, even though there's nothing speakable in it yet."""
+    event = message.event
+    if event.get("type") != "content_block_delta":
+        return False
+    return event.get("delta", {}).get("type") == "thinking_delta"
+
+
+# Spoken the instant a query goes out: in a voice interface, silence right
+# after you finish speaking reads as "it didn't hear me". Local TTS makes
+# this nearly free, and the real reply queues right behind it — so keep
+# every entry short enough to be done before the first streamed sentence.
+ACKNOWLEDGMENTS = ["On it.", "Okay.", "Let me look.", "Alright.", "One sec."]
+
+# Stall watchdog thresholds. Normal first-token waits and auto-approved
+# tool runs sit well under half a minute on this machine — past that,
+# "slow" and "stuck" must stop looking identical on the status line.
+STALL_WARN_SECS = 30
+STALL_HINT_SECS = 90
+
+
 async def ask_claude(client, text, speaker):
     """Send text to Claude. Spoken sentences stream to the TTS queue (the
     playback subtitle shows them live); the scrollback gets only artifacts —
@@ -1236,12 +1258,16 @@ async def ask_claude(client, text, speaker):
     _task_approval = False  # a whole-task grant never outlives its task
     _first_token_secs = None
     query_started = time.time()
+    ack = random.choice(ACKNOWLEDGMENTS)
+    append_transcript("Mabara", ack)
+    speaker.say(ack)
     await client.query(text)
     streamer = SentenceStreamer(speaker)
     session_id = None
     barged_in = False
     tool_calls = 0
     result_error = None
+    last_event = time.time()
 
     async def watch_for_barge_in():
         nonlocal barged_in
@@ -1256,10 +1282,46 @@ async def ask_claude(client, text, speaker):
                 return
             await asyncio.sleep(0.05)
 
+    async def watch_for_stall():
+        """A silent stream and a slow model look identical on a spinner —
+        after STALL_WARN_SECS of no messages at all, say so out loud, and
+        past STALL_HINT_SECS teach the way out. Warns only, never cancels:
+        barge-in is already the user's kill switch."""
+        nonlocal last_event
+        warned = 0
+        while True:
+            await asyncio.sleep(1.0)
+            if barged_in:
+                return
+            if _approval_active:
+                # The stream is waiting on the user's yes/no, not hung
+                last_event = time.time()
+                continue
+            quiet = time.time() - last_event
+            if quiet < STALL_WARN_SECS:
+                warned = 0  # events resumed; re-arm for a later stall
+            elif warned == 0:
+                warned = 1
+                clear_status()
+                print(f"  {dim(f'(nothing from Claude in {int(quiet)}s — still waiting)')}")
+                spoken = "Still with you — this is taking longer than usual."
+                append_transcript("Mabara", spoken)
+                speaker.say(spoken)
+            elif warned == 1 and quiet >= STALL_HINT_SECS:
+                warned = 2
+                clear_status()
+                print(f"  {dim(f'(no response for {int(quiet)}s — hold {PTT_LABEL} and speak to cut this off)')}")
+                spoken = ("Something may be stuck. Hold right control and "
+                          "speak, to cut this off and try again.")
+                append_transcript("Mabara", spoken)
+                speaker.say(spoken)
+
     watcher = asyncio.create_task(watch_for_barge_in())
+    stall_watcher = asyncio.create_task(watch_for_stall())
     start_thinking()
     try:
         async for message in client.receive_response():
+            last_event = time.time()
             session_id = get_message_session_id(message) or session_id
             # In-band failures (usage limit, API errors) don't raise — they
             # arrive as an error-flagged result with no spoken text at all,
@@ -1271,6 +1333,8 @@ async def ask_claude(client, text, speaker):
             # Speak only from raw deltas; complete AssistantMessages repeat
             # the same text and would double-speak it.
             if isinstance(message, StreamEvent) and message.parent_tool_use_id is None:
+                if is_thinking_delta(message):
+                    show_reasoning()
                 if message.event.get("type") == "content_block_stop":
                     streamer.flush()
                 chunk = get_stream_text(message)
@@ -1290,6 +1354,7 @@ async def ask_claude(client, text, speaker):
                         tool_calls += 1
     finally:
         watcher.cancel()
+        stall_watcher.cancel()
         stop_thinking()
         _task_approval = False
     if not barged_in:
@@ -1401,18 +1466,33 @@ class Ticker:
     """Animated one-line status for waits we can't shorten (model loading,
     the Claude CLI handshake, silent thinking/tool phases)."""
 
-    def __init__(self, messages):
-        self.messages = messages
+    def __init__(self, messages, hold_secs=2.5, elapsed_after=None):
+        self.messages = list(messages)
+        self._hold_secs = hold_secs
+        self._elapsed_after = elapsed_after
+        self._started = time.time()
         self._stop_event = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
+
+    def set_messages(self, messages):
+        """Swap the rotation mid-flight (e.g. 'thinking...' becomes
+        'reasoning...' once deltas reveal what the silence actually is).
+        A plain reference swap — the render loop rereads it every tick."""
+        self.messages = list(messages)
 
     def _run(self):
         frames = "|/-\\"
         i = 0
         while not self._stop_event.is_set():
+            elapsed = time.time() - self._started
             # Advance through the messages, then hold on the last one
-            msg = self.messages[min(i // 10, len(self.messages) - 1)]
+            messages = self.messages
+            msg = messages[min(int(elapsed / self._hold_secs), len(messages) - 1)]
+            # On long waits, an elapsed counter is the difference between
+            # "frozen" and "attended": the number moving proves liveness.
+            if self._elapsed_after is not None and elapsed >= self._elapsed_after:
+                msg = f"{msg} {int(elapsed)}s"
             status(f"{frames[i % 4]} {dim(msg)}")
             i += 1
             time.sleep(0.25)
@@ -1428,11 +1508,25 @@ class Ticker:
 # stop it (whichever comes first).
 _thinking = None
 
+# 6s per phase: a normal answer never sees past the first message, and the
+# elapsed counter only appears on waits long enough to feel worrying.
+THINKING_PHASES = ["thinking...", "still thinking...", "working on it..."]
+THINKING_HOLD_SECS = 6.0
+THINKING_ELAPSED_AFTER = 15.0
+
 
 def start_thinking():
     global _thinking
     if _thinking is None:
-        _thinking = Ticker(["thinking..."])
+        _thinking = Ticker(THINKING_PHASES, hold_secs=THINKING_HOLD_SECS,
+                           elapsed_after=THINKING_ELAPSED_AFTER)
+
+
+def show_reasoning():
+    """Reasoning deltas are streaming: the wait is the model thinking hard,
+    not a hang — name it on the status line instead of a generic spinner."""
+    if _thinking is not None:
+        _thinking.set_messages(["reasoning..."])
 
 
 def stop_thinking():
