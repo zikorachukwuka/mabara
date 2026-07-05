@@ -7,6 +7,9 @@ __pycache__/
 # Model weights — hundreds of MB; downloaded on setup (see README)
 models/
 
+# Internal engineering doc — machine-specific paths and account details
+engineering.md
+
 # Runtime state — private: conversation transcripts and session IDs
 data/
 
