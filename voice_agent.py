@@ -1,5 +1,6 @@
 import asyncio
 import re
+import difflib
 import time
 import queue
 import random
@@ -346,9 +347,12 @@ class GitSafety:
 
     def before_mutation(self, tool_name, tool_input):
         """Called when the user approves a mutating tool. Snapshots the tree
-        once per turn and remembers which files the task touches."""
+        once per turn and remembers which files the task touches. Returns
+        True when this call took the snapshot, so the caller can announce
+        it — a safety net nobody can see earns no trust."""
         if not self.enabled:
-            return
+            return False
+        created = False
         if self._ckpt_turn != self._turn:
             self._ckpt_turn = self._turn
             proc = self._git("stash", "create", "mabara checkpoint")
@@ -357,6 +361,7 @@ class GitSafety:
             self._untracked_backup = {}
             self._bash_ran = False
             self._task_label = self._pending_label
+            created = True
         if tool_name in ("Edit", "Write"):
             path = tool_input.get("file_path")
             if path:
@@ -371,6 +376,7 @@ class GitSafety:
                             pass
         elif tool_name == "Bash":
             self._bash_ran = True
+        return created
 
     def revert(self):
         """Undo the last edit-task. Returns a short spoken summary."""
@@ -454,6 +460,51 @@ class GitSafety:
         self._ckpt_turn = None
         n = len(rels)
         return f"Committed {n} file" + ("s." if n != 1 else ".")
+
+    def turn_diffstat(self):
+        """Per-file (relpath, added, removed) line counts for the files this
+        turn's task touched — the receipt of what actually changed, in the
+        diffstat shape git taught everyone to read. Empty when the current
+        turn made no checkpointed edits."""
+        if not self.enabled or self._ckpt_turn != self._turn:
+            return []
+        baseline = self._baseline or "HEAD"
+        stats = []
+        for path in self._touched:
+            # Forward slashes: backslashes are escape characters in git
+            # pathspecs, so a raw Windows relpath can silently match nothing
+            rel = os.path.relpath(path, self.repo).replace("\\", "/")
+            proc = self._git("diff", "--numstat", baseline, "--", rel)
+            out = proc.stdout.strip() if proc and proc.returncode == 0 else ""
+            if out:
+                added, removed = out.split("\t")[:2]
+                if added != "-":  # binary files have no line counts
+                    stats.append((rel, int(added), int(removed)))
+                continue
+            if self._is_tracked(path):
+                continue  # tracked and unchanged vs the checkpoint
+            # Untracked files are invisible to git diff: count by hand
+            if not os.path.exists(path):
+                continue
+            try:
+                with open(path, "r", encoding="utf-8", errors="replace") as f:
+                    new_lines = f.read().splitlines()
+            except OSError:
+                continue
+            if path in self._untracked_backup:
+                old_lines = self._untracked_backup[path].decode(
+                    "utf-8", "replace").splitlines()
+                added = removed = 0
+                for line in difflib.unified_diff(old_lines, new_lines,
+                                                 lineterm="", n=0):
+                    if line.startswith("+") and not line.startswith("+++"):
+                        added += 1
+                    elif line.startswith("-") and not line.startswith("---"):
+                        removed += 1
+                stats.append((rel, added, removed))
+            else:
+                stats.append((rel, len(new_lines), 0))
+        return stats
 
 
 _COMMIT_WORDS = {
@@ -993,6 +1044,55 @@ def describe_tool_use(name, tool_input):
     return name.lower()
 
 
+# A quiet success marker only when the command was slow enough that the
+# silence needed explaining; failures always print.
+BASH_OK_MARKER_SECS = 2.5
+
+# Denials already print their own 'denied' line in the approval flow — a
+# second 'failed' marker for the same event would read as two failures.
+# These match the deny messages this file itself sends back to the CLI.
+_DENIAL_MARKERS = ("declined", "no response captured", "read-only", "disabled")
+
+
+def _tool_result_text(content):
+    """First meaningful line of a tool result, for the failure marker."""
+    if isinstance(content, list):
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                content = item.get("text", "")
+                break
+        else:
+            content = ""
+    if not isinstance(content, str):
+        return ""
+    for line in content.splitlines():
+        line = line.strip()
+        if line:
+            return line if len(line) <= 64 else line[:63] + "…"
+    return ""
+
+
+def describe_tool_outcome(block, pending_tools):
+    """One dim feed line for a Bash/Edit/Write result: red for failures,
+    'ok · Ns' for slow successes — the marker that keeps the feed honest.
+    Reads/globs/greps stay silent: exploration probes fail all the time,
+    and a red mark on each would drown the real signal."""
+    name, started = pending_tools.pop(
+        getattr(block, "tool_use_id", None) or "", (None, None))
+    if name not in ("Bash", "Edit", "Write"):
+        return None
+    if getattr(block, "is_error", False):
+        detail = _tool_result_text(getattr(block, "content", None))
+        if any(marker in detail.lower() for marker in _DENIAL_MARKERS):
+            return None
+        suffix = f" — {detail}" if detail else ""
+        return f"  {red('!')} {dim(f'{name.lower()} failed{suffix}')}"
+    took = time.time() - started
+    if name == "Bash" and took >= BASH_OK_MARKER_SECS:
+        return f"  {dim(f'{TOOL_MARK} ok · {took:.0f}s')}"
+    return None
+
+
 def describe_action(tool_name, tool_input):
     if tool_name == "Edit":
         return f"edit the file {tool_input.get('file_path', 'unknown file')}"
@@ -1007,6 +1107,75 @@ def describe_action(tool_name, tool_input):
                   or "an unknown path")
         return f"read {target}, which is outside this repo"
     return f"use the tool {tool_name}"
+
+
+# Diffs longer than this are truncated on screen — a huge Write must not
+# flood a voice-first terminal (the full change still lands in the file).
+DIFF_MAX_LINES = 40
+# Past this, diffing costs more than the glanceable record is worth.
+DIFF_MAX_SOURCE_CHARS = 200_000
+
+CHECKPOINT_HINT = f"{CHECK} checkpoint saved — say 'revert that' to undo"
+
+
+def render_diff(tool_name, tool_input):
+    """Plain unified-diff lines for a pending Edit/Write, or None when there
+    is nothing to show. Edit diffs the two snippets and drops the @@ headers
+    — snippet-relative line numbers would be lies; Write diffs the real
+    file, so its @@ numbers are kept. Colors are applied at print time."""
+    if tool_name == "Edit":
+        old = tool_input.get("old_string") or ""
+        new = tool_input.get("new_string") or ""
+        keep_hunk_headers = False
+    elif tool_name == "Write":
+        new = tool_input.get("content") or ""
+        try:
+            with open(tool_input.get("file_path") or "", "r",
+                      encoding="utf-8", errors="replace") as f:
+                old = f.read()
+        except OSError:
+            old = ""  # new file: the whole diff is additions
+        keep_hunk_headers = True
+    else:
+        return None
+    if old == new:
+        return None
+    if len(old) > DIFF_MAX_SOURCE_CHARS or len(new) > DIFF_MAX_SOURCE_CHARS:
+        return [f"(too large to diff: {len(new.splitlines())} lines)"]
+    lines = []
+    for line in difflib.unified_diff(old.splitlines(), new.splitlines(),
+                                     lineterm="", n=2):
+        if line.startswith(("---", "+++")):
+            continue
+        if line.startswith("@@"):
+            if keep_hunk_headers:
+                lines.append(line)
+            elif lines:  # separator between hunks, never a lead-in
+                lines.append("...")
+            continue
+        lines.append(line)
+    return lines or None
+
+
+def print_diff(lines, path):
+    """Red/green git-style rendering, framed like the code blocks."""
+    rule = "-" * 46
+    header = f"--[ diff: {_short_path(path)} ]"
+    clear_status()
+    print(dim(header + rule[len(header):]))
+    shown = lines[:DIFF_MAX_LINES]
+    for line in shown:
+        if line.startswith("+"):
+            print(green(line))
+        elif line.startswith("-"):
+            print(red(line))
+        elif line.startswith("@@") or line == "...":
+            print(dim(line))
+        else:
+            print(line)
+    if len(lines) > len(shown):
+        print(dim(f"... +{len(lines) - len(shown)} more lines"))
+    print(dim(rule))
 
 
 async def voice_permission_callback(tool_name, tool_input, context):
@@ -1044,8 +1213,17 @@ async def voice_permission_callback(tool_name, tool_input, context):
 
     # "Yes, for the whole task" covers remaining edits this turn. Bash never
     # auto-approves — commands are where the unrecoverable sharp edges are.
+    # The diff still prints when nobody is asked: an unseen edit is the
+    # fastest way to lose the room.
     if tool_name in ("Edit", "Write") and _task_approval:
-        git_safety.before_mutation(tool_name, tool_input)
+        created = git_safety.before_mutation(tool_name, tool_input)
+        if created:
+            clear_status()
+            print(f"  {dim(CHECKPOINT_HINT)}")
+        diff = render_diff(tool_name, tool_input)
+        if diff:
+            print_diff(diff, tool_input.get("file_path", "?"))
+            print(f"  {dim('(auto-approved — whole-task grant)')}")
         return PermissionResultAllow()
 
     # Needs voice approval. The flag pauses the barge-in watcher (holding
@@ -1057,7 +1235,16 @@ async def voice_permission_callback(tool_name, tool_input, context):
         stop_thinking()
         description = describe_action(tool_name, tool_input)
         print(f"\n\n  {yellow('! approval needed')} — Mabara wants to {description}")
-        speaker.say(speakable(f"I'd like to {description}. Do you approve?"))
+        # Show the red/green before the yes/no — approving a change you
+        # haven't seen is the biggest trust gap a coding tool can have.
+        diff = (render_diff(tool_name, tool_input)
+                if tool_name in ("Edit", "Write") else None)
+        if diff:
+            print_diff(diff, tool_input.get("file_path", "?"))
+        question = f"I'd like to {description}."
+        if diff:
+            question += " The diff is on your screen."
+        speaker.say(speakable(question + " Do you approve?"))
         await asyncio.to_thread(speaker.wait_until_done)
 
         audio = await asyncio.to_thread(
@@ -1073,16 +1260,19 @@ async def voice_permission_callback(tool_name, tool_input, context):
         print(f"  {cyan('You »')} {answer.strip()}")
 
         if is_affirmative(answer):
-            git_safety.before_mutation(tool_name, tool_input)
+            created = git_safety.before_mutation(tool_name, tool_input)
             # "yes for the whole task" / "yes to all" widens the grant to
             # every remaining edit in this task
             if grants_whole_task(answer):
                 _task_approval = True
-                print(f"  {green('approved')} {dim('— and auto-approving edits for the rest of this task')}\n")
+                print(f"  {green('approved')} {dim('— and auto-approving edits for the rest of this task')}")
                 speaker.say("Okay — I'll handle the rest of this task's edits without asking.")
             else:
-                print(f"  {green('approved')}\n")
+                print(f"  {green('approved')}")
                 speaker.say("Okay, doing it now.")
+            if created:
+                print(f"  {dim(CHECKPOINT_HINT)}")
+            print()
             return PermissionResultAllow()
         else:
             print(f"  {dim('denied')}\n")
@@ -1248,11 +1438,21 @@ STALL_WARN_SECS = 30
 STALL_HINT_SECS = 90
 
 
-async def ask_claude(client, text, speaker):
+def _fmt_secs(secs):
+    """42s / 2m05s — the shape developers read on CI dashboards."""
+    secs = int(secs)
+    if secs < 60:
+        return f"{secs}s"
+    return f"{secs // 60}m{secs % 60:02d}s"
+
+
+async def ask_claude(client, text, speaker, label=None):
     """Send text to Claude. Spoken sentences stream to the TTS queue (the
     playback subtitle shows them live); the scrollback gets only artifacts —
-    tool-action lines, code blocks, approvals. Holding push-to-talk mid-response
-    barges in: speech stops and the model stops generating.
+    a task header, tool-action lines with outcome markers, code blocks,
+    diffs, approvals. Holding push-to-talk mid-response barges in: speech
+    stops and the model stops generating. `label` is the user's own words,
+    printed as the task header when tools start running.
     Returns (session_id, barged_in, streamer, tool_calls, result_error)."""
     global _task_approval, _first_token_secs
     _task_approval = False  # a whole-task grant never outlives its task
@@ -1266,6 +1466,7 @@ async def ask_claude(client, text, speaker):
     session_id = None
     barged_in = False
     tool_calls = 0
+    pending_tools = {}  # tool_use id -> (name, started) for outcome markers
     result_error = None
     last_event = time.time()
 
@@ -1346,12 +1547,27 @@ async def ask_claude(client, text, speaker):
                     streamer.feed(chunk)
             elif hasattr(message, "content") and isinstance(message.content, list):
                 # Complete AssistantMessages carry the tool calls — one dim
-                # line each is what makes the terminal read like work
+                # line each is what makes the terminal read like work. Tool
+                # results echo back the same way (as user messages), and
+                # Bash/Edit/Write outcomes get their honesty marker.
                 for block in message.content:
                     if hasattr(block, "name") and hasattr(block, "input"):
                         clear_status()
+                        if tool_calls == 0 and label:
+                            # First tool of the turn: pin the user's own
+                            # words above the feed so every line below has
+                            # a "what this was for"
+                            shown = label if len(label) <= 64 else label[:63] + "…"
+                            print(f"  {accent(DOT)} {dim('task:')} {shown}")
                         print(f"  {dim(f'{TOOL_MARK} {describe_tool_use(block.name, block.input)}')}")
                         tool_calls += 1
+                        if getattr(block, "id", None):
+                            pending_tools[block.id] = (block.name, time.time())
+                    elif hasattr(block, "tool_use_id"):
+                        outcome = describe_tool_outcome(block, pending_tools)
+                        if outcome:
+                            clear_status()
+                            print(outcome)
     finally:
         watcher.cancel()
         stall_watcher.cancel()
@@ -1802,9 +2018,12 @@ async def main():
                     continue
 
                 git_safety.begin_turn(text)
+                turn_started = time.time()
                 try:
                     session_id, interrupted, streamer, tool_calls, had_error = \
-                        await ask_claude(client, pending_note + text, speaker)
+                        await ask_claude(client, pending_note + text, speaker,
+                                         label=text.strip())
+                    turn_secs = time.time() - turn_started
                     pending_note = ""
                 except (KeyboardInterrupt, asyncio.CancelledError):
                     raise
@@ -1829,12 +2048,16 @@ async def main():
                     print(f"  {dim('(you cut in — go ahead)')}")
                     interrupted = True
                 if not interrupted and not had_error:
-                    summary = f"spoke {streamer.sentence_count} sentence" \
-                              + ("s" if streamer.sentence_count != 1 else "")
+                    summary = f"done in {_fmt_secs(turn_secs)}"
+                    summary += f" · spoke {streamer.sentence_count} sentence" \
+                               + ("s" if streamer.sentence_count != 1 else "")
                     if tool_calls:
                         summary += f" · {tool_calls} tool call" + ("s" if tool_calls != 1 else "")
                     clear_status()
                     print(f"  {green(CHECK)} {dim(summary)}")
+                    # The task's receipt: per-file line counts, diffstat-style
+                    for rel, added, removed in git_safety.turn_diffstat():
+                        print(f"    {dim(rel + ' |')} {green(f'+{added}')} {red(f'-{removed}')}")
                 first_token = (f"{_first_token_secs:.1f}s"
                                if _first_token_secs is not None else "n/a")
                 append_transcript("Debug", f"stt={stt_secs:.1f}s first_token={first_token}")

@@ -186,3 +186,101 @@ def test_speakable_shortens_paths():
         "open page.tsx now"
     assert va.speakable("see src/components/Button.jsx") == "see Button.jsx"
     assert va.speakable("no paths here") == "no paths here"
+
+# ---------- Diff rendering (shown before every edit approval) ----------
+
+def test_render_diff_edit_marks_changes():
+    lines = va.render_diff("Edit", {
+        "file_path": "x.py",
+        "old_string": "a\nb\nc",
+        "new_string": "a\nB\nc",
+    })
+    assert "-b" in lines and "+B" in lines
+    # Snippet diffs drop @@ headers: fragment-relative numbers would lie
+    assert not any(line.startswith("@@") for line in lines)
+
+
+def test_render_diff_identical_content_is_none():
+    assert va.render_diff("Edit", {
+        "file_path": "x.py", "old_string": "same", "new_string": "same",
+    }) is None
+
+
+def test_render_diff_write_new_file(tmp_path):
+    target = tmp_path / "brand_new.txt"
+    lines = va.render_diff("Write", {
+        "file_path": str(target), "content": "one\ntwo",
+    })
+    assert "+one" in lines and "+two" in lines
+    assert not any(line.startswith("-") and line != "---" for line in lines)
+
+
+def test_render_diff_write_existing_file_keeps_hunk_headers(tmp_path):
+    target = tmp_path / "existing.txt"
+    target.write_text("alpha\nbeta\ngamma\n", encoding="utf-8")
+    lines = va.render_diff("Write", {
+        "file_path": str(target), "content": "alpha\nBETA\ngamma\n",
+    })
+    assert "-beta" in lines and "+BETA" in lines
+    assert any(line.startswith("@@") for line in lines)
+
+
+def test_render_diff_other_tools_are_none():
+    assert va.render_diff("Bash", {"command": "ls"}) is None
+
+
+# ---------- Tool outcome markers ----------
+
+class _Block:
+    def __init__(self, tool_use_id, is_error=False, content=None):
+        self.tool_use_id = tool_use_id
+        self.is_error = is_error
+        self.content = content
+
+
+def test_bash_failure_gets_a_marker():
+    pending = {"t1": ("Bash", 0.0)}
+    line = va.describe_tool_outcome(
+        _Block("t1", is_error=True, content="command not found: pyest"), pending)
+    assert "bash failed" in line and "pyest" in line
+    assert pending == {}  # consumed
+
+
+def test_read_failures_stay_silent():
+    pending = {"t2": ("Read", 0.0)}
+    assert va.describe_tool_outcome(
+        _Block("t2", is_error=True, content="no such file"), pending) is None
+
+
+def test_denials_do_not_double_report():
+    pending = {"t3": ("Bash", 0.0)}
+    assert va.describe_tool_outcome(
+        _Block("t3", is_error=True, content="User declined via voice"),
+        pending) is None
+
+
+def test_fast_bash_success_stays_silent():
+    import time as _time
+    pending = {"t4": ("Bash", _time.time())}
+    assert va.describe_tool_outcome(_Block("t4"), pending) is None
+
+
+def test_slow_bash_success_gets_ok_marker():
+    import time as _time
+    pending = {"t5": ("Bash", _time.time() - 10)}
+    line = va.describe_tool_outcome(_Block("t5"), pending)
+    assert "ok" in line and "10s" in line
+
+
+def test_tool_result_text_handles_block_lists():
+    assert va._tool_result_text(
+        [{"type": "text", "text": "  \nerror: boom\nmore"}]) == "error: boom"
+    assert va._tool_result_text(None) == ""
+
+
+# ---------- Turn summary formatting ----------
+
+def test_fmt_secs():
+    assert va._fmt_secs(42) == "42s"
+    assert va._fmt_secs(125) == "2m05s"
+    assert va._fmt_secs(59.9) == "59s"
