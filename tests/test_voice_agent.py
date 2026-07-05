@@ -5,6 +5,7 @@ run with: venv/Scripts/python -m pytest tests/
 """
 
 import os
+import subprocess
 import sys
 
 import pytest
@@ -284,3 +285,90 @@ def test_fmt_secs():
     assert va._fmt_secs(42) == "42s"
     assert va._fmt_secs(125) == "2m05s"
     assert va._fmt_secs(59.9) == "59s"
+
+
+# ---------- GitSafety: mid-session git init + fresh-repo checkpoints ----------
+
+def _git(cwd, *args):
+    return subprocess.run(["git", "-C", str(cwd), *args],
+                          capture_output=True, text=True, timeout=30)
+
+
+def test_recheck_picks_up_mid_session_git_init(tmp_path):
+    gs = va.GitSafety(str(tmp_path))
+    assert not gs.enabled
+    assert not gs.recheck()   # still not a repo: stays blocked
+    _git(tmp_path, "init")
+    # The deny message promises 'git init enables editing' — recheck is what
+    # keeps that promise (live failure 2026-07-05: the cached False pushed
+    # the agent into a shell-heredoc workaround).
+    assert gs.recheck()
+    assert gs.enabled
+
+
+def test_fresh_repo_checkpoint_reverts_without_head(tmp_path):
+    _git(tmp_path, "init")    # no commits yet: HEAD doesn't exist
+    existing = tmp_path / "app.js"
+    existing.write_text("original", encoding="utf-8")
+    created = tmp_path / "new.js"
+
+    gs = va.GitSafety(str(tmp_path))
+    assert gs.enabled
+    gs.begin_turn("improve the design")
+    gs.before_mutation("Edit", {"file_path": str(existing)})
+    gs.before_mutation("Write", {"file_path": str(created)})
+    existing.write_text("mangled", encoding="utf-8")
+    created.write_text("brand new", encoding="utf-8")
+
+    assert not gs._head_at_ckpt   # stash create was skipped, backups taken
+    message = gs.revert()
+    assert existing.read_text(encoding="utf-8") == "original"
+    assert not created.exists()
+    assert "restored 1 file" in message and "removed 1 new file" in message
+
+
+# ---------- Spoken approval questions stay short ----------
+
+def test_spoken_command_short_commands_verbatim():
+    assert va.spoken_command("git init") == "the command: git init"
+
+
+def test_spoken_command_caps_heredocs():
+    heredoc = ('cat > "index.html" << EOF\n<!DOCTYPE html>\n'
+               + "x\n" * 100 + "EOF")
+    text = va.spoken_command(heredoc)
+    assert "<!DOCTYPE" not in text
+    assert text.startswith('the command: cat > "index.html" << EOF')
+    assert "full command is on your screen" in text
+
+
+def test_spoken_command_caps_long_single_lines():
+    text = va.spoken_command("echo " + "a" * 200)
+    assert len(text) < 160
+    assert "on your screen" in text
+
+
+def test_describe_action_spoken_variant_truncates_screen_does_not():
+    tool_input = {"command": "git status\ngit log --oneline"}
+    assert "git log --oneline" in va.describe_action("Bash", tool_input)
+    spoken = va.describe_action("Bash", tool_input, spoken=True)
+    assert "git log" not in spoken
+    assert "on your screen" in spoken
+
+
+def test_print_command_truncates_like_diffs(capsys):
+    va.print_command("\n".join(f"line{i}" for i in range(60)))
+    out = capsys.readouterr().out
+    assert "line0" in out and "line39" in out
+    assert "line45" not in out
+    assert "+20 more lines" in out
+
+
+# ---------- Tool feed honesty ----------
+
+def test_feed_shows_out_of_repo_paths_in_full(repo):
+    inside = os.path.join(str(repo), "public", "app.js")
+    outside = os.path.join(os.path.dirname(str(repo)), "elsewhere", "app.js")
+    assert va.describe_tool_use("Read", {"file_path": inside}) == "read public/app.js"
+    # An out-of-repo probe must never be shortened into looking local
+    assert outside in va.describe_tool_use("Read", {"file_path": outside})

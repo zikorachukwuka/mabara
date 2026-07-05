@@ -339,6 +339,7 @@ class GitSafety:
         self._turn = 0
         self._ckpt_turn = None   # turn the current checkpoint belongs to
         self._baseline = None    # stash-create sha; None means use HEAD
+        self._head_at_ckpt = True  # False: repo had no commits at checkpoint time
         self._touched = []       # absolute paths of approved Edit/Write targets
         self._untracked_backup = {}  # path -> original bytes
         self._bash_ran = False
@@ -360,6 +361,18 @@ class GitSafety:
         proc = self._git("ls-files", "--error-unmatch", "--", path)
         return proc is not None and proc.returncode == 0
 
+    def recheck(self):
+        """Re-detect the repo when edits are blocked. `enabled` is a startup
+        snapshot, but the deny message itself tells the user that git init
+        fixes the block — a cached False must not outlive the fact it
+        describes. (Live failure 2026-07-05: the agent ran the suggested git
+        init, kept being told 'not a git repository', concluded Edit/Write
+        were broken, and routed around the gate with a shell heredoc.)"""
+        if not self.enabled:
+            proc = self._git("rev-parse", "--is-inside-work-tree")
+            self.enabled = proc is not None and proc.stdout.strip() == "true"
+        return self.enabled
+
     def begin_turn(self, label=""):
         self._turn += 1
         self._pending_label = label
@@ -374,8 +387,16 @@ class GitSafety:
         created = False
         if self._ckpt_turn != self._turn:
             self._ckpt_turn = self._turn
-            proc = self._git("stash", "create", "mabara checkpoint")
-            self._baseline = (proc.stdout.strip() or None) if proc else None
+            # A repo with no commits yet (fresh git init) has no HEAD: stash
+            # create fails and 'checkout HEAD' can't restore anything, so the
+            # byte backups below must cover every touched file, not just the
+            # untracked ones.
+            head = self._git("rev-parse", "--verify", "--quiet", "HEAD")
+            self._head_at_ckpt = head is not None and head.returncode == 0
+            self._baseline = None
+            if self._head_at_ckpt:
+                proc = self._git("stash", "create", "mabara checkpoint")
+                self._baseline = (proc.stdout.strip() or None) if proc else None
             self._touched = []
             self._untracked_backup = {}
             self._bash_ran = False
@@ -387,7 +408,8 @@ class GitSafety:
                 path = os.path.abspath(path)
                 if path not in self._touched:
                     self._touched.append(path)
-                    if os.path.exists(path) and not self._is_tracked(path):
+                    if os.path.exists(path) and (
+                            not self._head_at_ckpt or not self._is_tracked(path)):
                         try:
                             with open(path, "rb") as f:
                                 self._untracked_backup[path] = f.read()
@@ -412,6 +434,17 @@ class GitSafety:
                     with open(path, "wb") as f:
                         f.write(self._untracked_backup[path])
                     restored += 1
+                except OSError:
+                    failed += 1
+                continue
+            if not self._head_at_ckpt:
+                # No commits at checkpoint time: every file that existed then
+                # got a byte backup above, so anything left was created by
+                # the task — undoing means deleting it.
+                try:
+                    if os.path.exists(path):
+                        os.remove(path)
+                        removed += 1
                 except OSError:
                     failed += 1
                 continue
@@ -493,14 +526,17 @@ class GitSafety:
             # Forward slashes: backslashes are escape characters in git
             # pathspecs, so a raw Windows relpath can silently match nothing
             rel = os.path.relpath(path, self.repo).replace("\\", "/")
-            proc = self._git("diff", "--numstat", baseline, "--", rel)
+            # With no HEAD at checkpoint time git diff has nothing to diff
+            # against — the byte backups below carry the whole receipt.
+            proc = (self._git("diff", "--numstat", baseline, "--", rel)
+                    if self._head_at_ckpt else None)
             out = proc.stdout.strip() if proc and proc.returncode == 0 else ""
             if out:
                 added, removed = out.split("\t")[:2]
                 if added != "-":  # binary files have no line counts
                     stats.append((rel, int(added), int(removed)))
                 continue
-            if self._is_tracked(path):
+            if self._head_at_ckpt and self._is_tracked(path):
                 continue  # tracked and unchanged vs the checkpoint
             # Untracked files are invisible to git diff: count by hand
             if not os.path.exists(path):
@@ -960,6 +996,13 @@ class Speaker:
 # ---------- Permission callback (auto-approve reads, ask before writes) ----------
 
 READ_ONLY_TOOLS = {"Read", "Glob", "Grep"}
+# NOTE: the CLI runs its own read-only analysis first and auto-approves
+# commands it deems safe — including cd+&&-chained compounds — without ever
+# consulting can_use_tool (observed live 2026-07-05: `cd repo && git status`
+# never reached the callback). This allowlist therefore only governs what
+# the CLI would otherwise ask about; it cannot be the *only* line of
+# defense for anything (which is why --readonly also disallows Bash at the
+# CLI level, below in main()).
 # git branch is deliberately absent: it creates, force-moves, and deletes
 # branches — those are writes, whatever the name suggests.
 READ_ONLY_BASH_PREFIXES = (
@@ -1042,14 +1085,24 @@ def _short_path(path):
     return "/".join(parts[-2:]) if len(parts) > 1 else str(path)
 
 
+def _feed_path(path):
+    """_short_path, except a path outside the repo shows in full: rendering
+    C:/Users/DELL/Documents/project/index.html as 'project/index.html' once
+    disguised an out-of-repo probe as a local read."""
+    p = str(path)
+    if os.path.isabs(p) and repo_root and not _path_within(p, repo_root):
+        return p
+    return _short_path(p)
+
+
 def describe_tool_use(name, tool_input):
     """One dim scrollback line per tool call — the 'work happening' feed."""
     if name == "Read":
-        return f"read {_short_path(tool_input.get('file_path', '?'))}"
+        return f"read {_feed_path(tool_input.get('file_path', '?'))}"
     if name == "Edit":
-        return f"edit {_short_path(tool_input.get('file_path', '?'))}"
+        return f"edit {_feed_path(tool_input.get('file_path', '?'))}"
     if name == "Write":
-        return f"write {_short_path(tool_input.get('file_path', '?'))}"
+        return f"write {_feed_path(tool_input.get('file_path', '?'))}"
     if name == "Glob":
         return f"glob {tool_input.get('pattern', '?')}"
     if name == "Grep":
@@ -1067,8 +1120,9 @@ def describe_tool_use(name, tool_input):
 # silence needed explaining; failures always print.
 BASH_OK_MARKER_SECS = 2.5
 
-# Denials already print their own 'denied' line in the approval flow — a
-# second 'failed' marker for the same event would read as two failures.
+# Denials already print their own line at deny time — voice denials in the
+# approval flow, gate denials (read-only, no-git) right in the callback — so
+# a second 'failed' marker for the same event would read as two failures.
 # These match the deny messages this file itself sends back to the CLI.
 _DENIAL_MARKERS = ("declined", "no response captured", "read-only", "disabled")
 
@@ -1112,13 +1166,35 @@ def describe_tool_outcome(block, pending_tools):
     return None
 
 
-def describe_action(tool_name, tool_input):
+# A spoken command longer than this is noise, not information — the full
+# text is on screen. Reading a 100-line heredoc aloud once held a user
+# hostage for 75 seconds with the mic closed and Ctrl+C the only way out.
+BASH_SPOKEN_MAX = 70
+
+
+def spoken_command(command):
+    """A speakable rendition of a Bash command: its first line, capped."""
+    lines = [l.strip() for l in str(command).strip().splitlines() if l.strip()]
+    first = lines[0] if lines else "an empty command"
+    clipped = len(lines) > 1 or len(first) > BASH_SPOKEN_MAX
+    if len(first) > BASH_SPOKEN_MAX:
+        first = first[:BASH_SPOKEN_MAX].rstrip() + "…"
+    text = f"the command: {first}"
+    if clipped:
+        text += " — the full command is on your screen"
+    return text
+
+
+def describe_action(tool_name, tool_input, spoken=False):
     if tool_name == "Edit":
         return f"edit the file {tool_input.get('file_path', 'unknown file')}"
     if tool_name == "Write":
         return f"write to the file {tool_input.get('file_path', 'unknown file')}"
     if tool_name == "Bash":
-        return f"run the command: {tool_input.get('command', 'unknown command')}"
+        command = tool_input.get("command", "unknown command")
+        if spoken:
+            return f"run {spoken_command(command)}"
+        return f"run the command: {command}"
     if tool_name in READ_ONLY_TOOLS:
         # Only reachable when the target is outside the repo — in-repo
         # reads were auto-approved before the question was ever asked.
@@ -1197,6 +1273,22 @@ def print_diff(lines, path):
     print(dim(rule))
 
 
+def print_command(command):
+    """Frame a multi-line pending command like the diff blocks, truncated
+    the same way — approving from a wall of raw heredoc is not informed
+    consent, and it must not scroll the question off the screen."""
+    rule = "-" * 46
+    header = "--[ command ]"
+    clear_status()
+    print(dim(header + rule[len(header):]))
+    lines = str(command).splitlines()
+    for line in lines[:DIFF_MAX_LINES]:
+        print(line)
+    if len(lines) > DIFF_MAX_LINES:
+        print(dim(f"... +{len(lines) - DIFF_MAX_LINES} more lines"))
+    print(dim(rule))
+
+
 async def voice_permission_callback(tool_name, tool_input, context):
     global _approval_active, _task_approval
 
@@ -1213,6 +1305,8 @@ async def voice_permission_callback(tool_name, tool_input, context):
     # before the read-only Bash allowlist so that, as the flag's help
     # promises, no shell command runs at all in a read-only session.
     if readonly_mode and tool_name in ("Edit", "Write", "Bash"):
+        clear_status()
+        print(f"  {red('!')} {dim(describe_tool_use(tool_name, tool_input) + ' — blocked (read-only session)')}")
         return PermissionResultDeny(message=(
             "This session is read-only: edits and commands are disabled. "
             "Explain or show code instead of changing anything."
@@ -1222,13 +1316,24 @@ async def voice_permission_callback(tool_name, tool_input, context):
         return PermissionResultAllow()
 
     # No git, no edits: without a checkpoint to revert to, a bad edit by
-    # voice is unrecoverable. Claude relays this to the user out loud.
+    # voice is unrecoverable. Claude relays this to the user out loud. The
+    # folder can BECOME a repo mid-session (the deny message itself says git
+    # init fixes the block), so re-check before denying — trusting the
+    # startup snapshot once sent the agent around the gate via a shell
+    # heredoc. The denial also prints: a blocked edit that leaves no mark
+    # looks exactly like a successful one in the tool feed.
     if tool_name in ("Edit", "Write") and not git_safety.enabled:
-        return PermissionResultDeny(message=(
-            "Edits are disabled: this folder is not a git repository, so "
-            "there is no safety net to undo changes. Tell the user that "
-            "running git init in this folder enables editing."
-        ))
+        if git_safety.recheck():
+            clear_status()
+            print(f"  {dim(f'{CHECK} git repository detected — edits enabled')}")
+        else:
+            clear_status()
+            print(f"  {red('!')} {dim(describe_tool_use(tool_name, tool_input) + ' — blocked: not a git repository')}")
+            return PermissionResultDeny(message=(
+                "Edits are disabled: this folder is not a git repository, so "
+                "there is no safety net to undo changes. Tell the user that "
+                "running git init in this folder enables editing."
+            ))
 
     # "Yes, for the whole task" covers remaining edits this turn. Bash never
     # auto-approves — commands are where the unrecoverable sharp edges are.
@@ -1252,19 +1357,27 @@ async def voice_permission_callback(tool_name, tool_input, context):
     _approval_active = True
     try:
         stop_thinking()
-        description = describe_action(tool_name, tool_input)
-        print(f"\n\n  {yellow('! approval needed')} — Mabara wants to {description}")
+        command = str(tool_input.get("command", "")) if tool_name == "Bash" else ""
+        if "\n" in command.strip():
+            # Multi-line commands get the framed, truncated treatment —
+            # never a raw flood inside the approval banner.
+            print(f"\n\n  {yellow('! approval needed')} — Mabara wants to run this command:")
+            print_command(command)
+        else:
+            print(f"\n\n  {yellow('! approval needed')} — Mabara wants to {describe_action(tool_name, tool_input)}")
         # Show the red/green before the yes/no — approving a change you
         # haven't seen is the biggest trust gap a coding tool can have.
         diff = (render_diff(tool_name, tool_input)
                 if tool_name in ("Edit", "Write") else None)
         if diff:
             print_diff(diff, tool_input.get("file_path", "?"))
-        question = f"I'd like to {description}."
+        question = f"I'd like to {describe_action(tool_name, tool_input, spoken=True)}."
         if diff:
             question += " The diff is on your screen."
         speaker.say(speakable(question + " Do you approve?"))
-        await asyncio.to_thread(speaker.wait_until_done)
+        # Holding push-to-talk cuts the question short and answers right
+        # away — nobody should sit through speech they've already read.
+        await asyncio.to_thread(speaker.wait_or_interrupt)
 
         audio = await asyncio.to_thread(
             recorder.record_while_held, f"hold {PTT_LABEL} to answer (yes / no)"
@@ -1850,16 +1963,24 @@ async def main():
         ticker.stop()  # same as below: keep the spinner off the traceback
         raise
 
+    # Subagents are poison for a real-time voice loop: Task is
+    # auto-approved by the CLI (bypassing voice approval), runs cold and
+    # slow, and background agents finish between turns where nobody is
+    # listening ("still waiting on that agent..."). Haiku especially
+    # loves delegating trivial lookups to them.
+    disallowed = ["Task"]
+    if args.readonly:
+        # The CLI auto-approves Bash it deems read-only (even compound
+        # commands) without consulting can_use_tool, so the callback deny
+        # alone cannot keep --readonly's promise that no shell command runs
+        # at all. Remove the mutating tools from the toolset outright; the
+        # callback deny stays as a second layer.
+        disallowed += ["Bash", "Edit", "Write", "NotebookEdit"]
     options = ClaudeAgentOptions(
         cwd=repo_path,
         model=args.model,
         allowed_tools=["Read", "Glob", "Grep"],
-        # Subagents are poison for a real-time voice loop: Task is
-        # auto-approved by the CLI (bypassing voice approval), runs cold and
-        # slow, and background agents finish between turns where nobody is
-        # listening ("still waiting on that agent..."). Haiku especially
-        # loves delegating trivial lookups to them.
-        disallowed_tools=["Task"],
+        disallowed_tools=disallowed,
         can_use_tool=voice_permission_callback,
         resume=resume_id,
         include_partial_messages=True,
@@ -1911,6 +2032,15 @@ async def main():
             "tried didn't work, say so directly and what you're trying "
             "instead. When the user asks you to explain or teach, shift into "
             "full tutor mode: unhurried, thorough, spoken explanation."
+            + (f"\n\nYour working directory is {repo_path}. Every relative "
+               "path resolves there and Bash commands already run from it — "
+               "never prefix commands with cd, and never guess at other "
+               "locations. Change files only with the Edit and Write tools, "
+               "never via shell redirection or heredocs: shell writes bypass "
+               "the diff the user approves and the checkpoint that makes "
+               "changes revertable. If a tool refusal contradicts what you "
+               "can see in the repo, tell the user instead of working "
+               "around it.")
             + (f"\n\nYou start this session as the '{args.model}' model. The "
                "user can switch models by voice at any time: 'switch to "
                "haiku' trades depth for speed and a lighter usage quota, "
