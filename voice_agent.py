@@ -61,6 +61,7 @@ def _load_audio():
             np = numpy
             sd = sounddevice
             keyboard = _keyboard
+            keyboard.hook(_track_ptt)
 
 
 SAMPLERATE = 16000
@@ -71,6 +72,24 @@ MIN_SPEECH_SECONDS = 0.4
 # of normal typing (shortcuts live on left Ctrl) and is comfortable to hold.
 PUSH_TO_TALK_KEY = "right ctrl"
 PTT_LABEL = "RIGHT CTRL"  # how the key is written in on-screen hints
+
+# Polling keyboard.is_pressed(PUSH_TO_TALK_KEY) also fired for LEFT ctrl:
+# Windows reports scan code 29 for both Ctrl keys (only an "extended" flag
+# tells them apart), and the library's name table maps 29 to "right ctrl"
+# too — so Ctrl+C/Ctrl+S while typing read as push-to-talk. Key *events* do
+# resolve left vs right in their name, so track the key's state from a hook
+# (installed in _load_audio) and poll that flag instead.
+_ptt_down = False
+
+
+def _track_ptt(event):
+    global _ptt_down
+    if event.name and event.name.lower() == PUSH_TO_TALK_KEY:
+        _ptt_down = event.event_type == keyboard.KEY_DOWN
+
+
+def ptt_pressed():
+    return _ptt_down
 _HERE = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(_HERE, "models")   # downloaded TTS models/voices
 DATA_DIR = os.path.join(_HERE, "data")       # runtime state (sessions, transcripts)
@@ -623,11 +642,11 @@ class Recorder:
                 while self._preroll and self._preroll[0][0] < cutoff:
                     self._preroll.pop(0)
 
-    def record_while_held(self, prompt=None, key=PUSH_TO_TALK_KEY):
+    def record_while_held(self, prompt=None):
         if prompt is None:
             prompt = f"hold {PTT_LABEL} to talk"
         status(dim(f"» {prompt}"))
-        while not keyboard.is_pressed(key):
+        while not ptt_pressed():
             time.sleep(0.01)
 
         status(f"{red(DOT)} listening — release when done")
@@ -635,7 +654,7 @@ class Recorder:
             self._frames = [block for _, block in self._preroll]
             self._preroll = []
 
-        while keyboard.is_pressed(key):
+        while ptt_pressed():
             time.sleep(0.01)
 
         status(dim("transcribing..."))
@@ -844,7 +863,7 @@ class Speaker:
             while self._pending:
                 self._cv.wait(timeout=0.2)
 
-    def wait_or_interrupt(self, key=PUSH_TO_TALK_KEY):
+    def wait_or_interrupt(self):
         """Block until speech finishes, or until the push-to-talk key cuts
         it off. Returns True if the user barged in (the key is still held,
         so a recording can start immediately)."""
@@ -852,7 +871,7 @@ class Speaker:
             with self._cv:
                 if not self._pending:
                     return False
-            if keyboard.is_pressed(key):
+            if ptt_pressed():
                 self.interrupt()
                 return True
             time.sleep(0.02)
@@ -1473,7 +1492,7 @@ async def ask_claude(client, text, speaker, label=None):
     async def watch_for_barge_in():
         nonlocal barged_in
         while True:
-            if not _approval_active and keyboard.is_pressed(PUSH_TO_TALK_KEY):
+            if not _approval_active and ptt_pressed():
                 barged_in = True
                 speaker.interrupt()
                 try:
