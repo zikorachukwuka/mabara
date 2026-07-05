@@ -2,6 +2,7 @@
 venv/
 __pycache__/
 *.pyc
+.pytest_cache/
 
 # Model weights — hundreds of MB; downloaded on setup (see README)
 models/
@@ -10,4 +11,4 @@ models/
 data/
 
 # Voice recordings — contain the developer's actual voice
-tests/*.wav
+scripts/*.wav

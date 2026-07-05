@@ -63,6 +63,8 @@ def _load_audio():
 
 
 SAMPLERATE = 16000
+# Recordings shorter than this are a key tap (pre-roll only), not speech
+MIN_SPEECH_SECONDS = 0.4
 # Right Ctrl instead of space: space made typing impossible while Mabara
 # talks (any space bar press triggered barge-in). Right Ctrl is never part
 # of normal typing (shortcuts live on left Ctrl) and is comfortable to hold.
@@ -151,6 +153,9 @@ recorder = None
 git_safety = None
 readonly_mode = False
 debug_mode = False
+# Absolute path of the repo this session talks about. Auto-approved reads are
+# confined to it; None (before main() sets it) means nothing auto-approves.
+repo_root = None
 
 # Seconds from query to Claude's first text delta, set by ask_claude each
 # turn — the number that separates "model is slow" from "audio is slow"
@@ -239,8 +244,13 @@ def load_sessions():
 def save_session(repo_path, session_id):
     sessions = load_sessions()
     sessions[repo_path] = session_id
-    with open(SESSION_STORE_FILE, "w") as f:
+    # Write-then-rename: a crash mid-write must not corrupt the store —
+    # load_sessions answers a corrupt file by silently forgetting every
+    # saved conversation.
+    tmp_file = SESSION_STORE_FILE + ".tmp"
+    with open(tmp_file, "w") as f:
         json.dump(sessions, f, indent=2)
+    os.replace(tmp_file, SESSION_STORE_FILE)
 
 
 def prompt_resume(session_id):
@@ -260,12 +270,21 @@ def prompt_resume(session_id):
     return not answer.strip().lower().startswith("n")
 
 
+# Rotation cap: transcripts hold everything both sides say, in plaintext,
+# forever — bound the exposure (and the disk) at ~2x this across the live
+# file and one .1 backup instead of growing without limit.
+TRANSCRIPT_MAX_BYTES = 5 * 1024 * 1024
+
+
 def append_transcript(role, text):
     """The terminal only shows subtitles while Mabara speaks; the full prose
     lands here so it can always be re-read."""
     if not text:
         return
     try:
+        if (os.path.exists(TRANSCRIPT_FILE)
+                and os.path.getsize(TRANSCRIPT_FILE) >= TRANSCRIPT_MAX_BYTES):
+            os.replace(TRANSCRIPT_FILE, TRANSCRIPT_FILE + ".1")
         with open(TRANSCRIPT_FILE, "a", encoding="utf-8") as f:
             f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {role}: {text}\n")
     except OSError:
@@ -284,6 +303,15 @@ class GitSafety:
 
     def __init__(self, repo_path):
         self.repo = repo_path
+        # Resolve git once and by absolute path. Windows' executable search
+        # includes the current directory, and mabara is typically launched
+        # from inside the repo it's pointed at — an untrusted repo could
+        # plant its own git.exe at its root. Refuse any git that lives
+        # inside the target repo.
+        exe = shutil.which("git")
+        if exe and _path_within(exe, repo_path):
+            exe = None
+        self._git_exe = exe
         proc = self._git("rev-parse", "--is-inside-work-tree")
         self.enabled = proc is not None and proc.stdout.strip() == "true"
         status = self._git("status", "--porcelain") if self.enabled else None
@@ -298,9 +326,11 @@ class GitSafety:
         self._pending_label = ""
 
     def _git(self, *args):
+        if self._git_exe is None:
+            return None
         try:
             return subprocess.run(
-                ["git", "-C", self.repo, *args],
+                [self._git_exe, "-C", self.repo, *args],
                 capture_output=True, text=True, timeout=30,
             )
         except (OSError, subprocess.TimeoutExpired):
@@ -477,6 +507,38 @@ def is_revert_command(text):
     words = re.findall(r"[a-z']+", text.lower())
     return (bool(words) and words[0] in ("revert", "undo")
             and len(words) <= 6 and all(w in _REVERT_WORDS for w in words))
+
+
+_YES_WORDS = {
+    "yes", "yeah", "yep", "yup", "sure", "okay", "ok", "go", "ahead",
+    "approve", "approved", "affirmative", "do",
+}
+_NO_WORDS = {
+    "no", "nope", "nah", "not", "don't", "dont", "stop", "deny", "denied",
+    "decline", "cancel", "never", "negative", "wait", "hold",
+}
+
+
+def is_affirmative(answer):
+    """Spoken yes/no for approvals. Matches whole words, never substrings
+    ('ok' must not fire inside 'look' or 'broken'), any deny word vetoes
+    the whole answer ('yes— wait, no' is a no), and anything ambiguous or
+    empty is a no: the gate in front of edits and commands fails closed."""
+    words = set(re.findall(r"[a-z']+", answer.lower()))
+    if words & _NO_WORDS:
+        return False
+    return bool(words & _YES_WORDS)
+
+
+_TASK_GRANT_WORDS = {"task", "everything", "all"}
+
+
+def grants_whole_task(answer):
+    """'yes for the whole task' / 'yes to all' — only consulted after
+    is_affirmative already said yes. Whole words only, so 'actually'
+    doesn't smuggle in 'all'."""
+    words = set(re.findall(r"[a-z']+", answer.lower()))
+    return bool(words & _TASK_GRANT_WORDS)
 
 
 # ---------- Sync helpers (recording + transcription) ----------
@@ -828,9 +890,11 @@ class Speaker:
 # ---------- Permission callback (auto-approve reads, ask before writes) ----------
 
 READ_ONLY_TOOLS = {"Read", "Glob", "Grep"}
+# git branch is deliberately absent: it creates, force-moves, and deletes
+# branches — those are writes, whatever the name suggests.
 READ_ONLY_BASH_PREFIXES = (
     "ls", "dir", "cat", "type", "git status", "git log",
-    "git diff", "git branch", "pwd", "echo",
+    "git diff", "pwd", "echo",
 )
 
 
@@ -839,12 +903,68 @@ READ_ONLY_BASH_PREFIXES = (
 # a command from auto-approval regardless of how it starts.
 BASH_UNSAFE_PATTERN = re.compile(r"[;&|><`\n]|\$\(")
 
+# git log/diff write files via --output (and -o in some subcommands) with no
+# shell redirection involved. A false positive here just falls back to voice
+# approval, so match generously.
+BASH_WRITE_FLAG_PATTERN = re.compile(r"(^|\s)(-o|--output(-directory)?)(=|\s|$)")
+
+
+def _path_within(path, root):
+    """True if path resolves inside root (case-insensitive drive-safe)."""
+    target = os.path.normcase(os.path.abspath(path))
+    root = os.path.normcase(os.path.abspath(root))
+    try:
+        return os.path.commonpath([target, root]) == root
+    except ValueError:  # e.g. paths on different Windows drives
+        return False
+
+
+def _within_repo(path):
+    """True if a tool-input path stays inside the session repo. No path at
+    all means the tool defaults to the repo cwd, which is fine; before
+    main() sets repo_root, nothing passes — the check fails closed."""
+    if not path:
+        return True
+    if repo_root is None:
+        return False
+    return _path_within(os.path.expanduser(str(path)), repo_root)
+
+
+def _bash_arg_within_repo(token):
+    """Repo confinement for a cat/type argument. Relative paths resolve
+    against the repo because the SDK runs Bash with cwd=repo."""
+    path = os.path.expanduser(token)
+    if not os.path.isabs(path):
+        if repo_root is None:
+            return False
+        path = os.path.join(repo_root, path)
+    return _within_repo(path)
+
 
 def is_read_only_bash(command):
+    """True only for commands that are provably look-don't-touch: an exact
+    allowlisted command word (whole-word — 'ls' must not match 'lsfoo'), no
+    chaining/redirection, no file-writing flags, and cat/type confined to
+    the repo like the Read tool. Anything else falls to voice approval."""
     if BASH_UNSAFE_PATTERN.search(command):
         return False
-    command = command.strip().lower()
-    return any(command.startswith(prefix) for prefix in READ_ONLY_BASH_PREFIXES)
+    command = command.strip()
+    lowered = command.lower()
+    if BASH_WRITE_FLAG_PATTERN.search(lowered):
+        return False
+    if not any(lowered == p or lowered.startswith(p + " ")
+               for p in READ_ONLY_BASH_PREFIXES):
+        return False
+    # cat/type print file contents — hold them to the Read tool's rule:
+    # only files inside the repo are free to read.
+    tokens = command.split()
+    if tokens[0].lower() in ("cat", "type"):
+        for token in tokens[1:]:
+            if token.startswith("-"):
+                continue
+            if not _bash_arg_within_repo(token):
+                return False
+    return True
 
 
 def _short_path(path):
@@ -880,25 +1000,38 @@ def describe_action(tool_name, tool_input):
         return f"write to the file {tool_input.get('file_path', 'unknown file')}"
     if tool_name == "Bash":
         return f"run the command: {tool_input.get('command', 'unknown command')}"
+    if tool_name in READ_ONLY_TOOLS:
+        # Only reachable when the target is outside the repo — in-repo
+        # reads were auto-approved before the question was ever asked.
+        target = (tool_input.get("file_path") or tool_input.get("path")
+                  or "an unknown path")
+        return f"read {target}, which is outside this repo"
     return f"use the tool {tool_name}"
 
 
 async def voice_permission_callback(tool_name, tool_input, context):
     global _approval_active, _task_approval
 
+    # Reads are free — but only inside the session's repo. A prompt-injected
+    # instruction in an untrusted repo ("read ~/.ssh/id_rsa") must land on
+    # the voice approval below, not sail through.
     if tool_name in READ_ONLY_TOOLS:
-        return PermissionResultAllow()
-
-    if tool_name == "Bash" and is_read_only_bash(tool_input.get("command", "")):
-        return PermissionResultAllow()
+        path = tool_input.get("file_path") or tool_input.get("path")
+        if _within_repo(path):
+            return PermissionResultAllow()
 
     # --readonly: a hard no for anything that changes state, regardless of
-    # approvals — for exploring repos that must not be touched.
+    # approvals — for exploring repos that must not be touched. Checked
+    # before the read-only Bash allowlist so that, as the flag's help
+    # promises, no shell command runs at all in a read-only session.
     if readonly_mode and tool_name in ("Edit", "Write", "Bash"):
         return PermissionResultDeny(message=(
             "This session is read-only: edits and commands are disabled. "
             "Explain or show code instead of changing anything."
         ))
+
+    if tool_name == "Bash" and is_read_only_bash(tool_input.get("command", "")):
+        return PermissionResultAllow()
 
     # No git, no edits: without a checkpoint to revert to, a bad edit by
     # voice is unrecoverable. Claude relays this to the user out loud.
@@ -939,11 +1072,11 @@ async def voice_permission_callback(tool_name, tool_input, context):
         clear_status()
         print(f"  {cyan('You »')} {answer.strip()}")
 
-        if any(word in answer for word in ["yes", "yeah", "sure", "go ahead", "okay", "ok"]):
+        if is_affirmative(answer):
             git_safety.before_mutation(tool_name, tool_input)
             # "yes for the whole task" / "yes to all" widens the grant to
             # every remaining edit in this task
-            if any(word in answer for word in ["task", "everything", "all"]):
+            if grants_whole_task(answer):
                 _task_approval = True
                 print(f"  {green('approved')} {dim('— and auto-approving edits for the rest of this task')}\n")
                 speaker.say("Okay — I'll handle the rest of this task's edits without asking.")
@@ -1098,7 +1231,7 @@ async def ask_claude(client, text, speaker):
     playback subtitle shows them live); the scrollback gets only artifacts —
     tool-action lines, code blocks, approvals. Holding push-to-talk mid-response
     barges in: speech stops and the model stops generating.
-    Returns (session_id, barged_in, streamer, tool_calls)."""
+    Returns (session_id, barged_in, streamer, tool_calls, result_error)."""
     global _task_approval, _first_token_secs
     _task_approval = False  # a whole-task grant never outlives its task
     _first_token_secs = None
@@ -1312,10 +1445,12 @@ def stop_thinking():
 # ---------- Main loop ----------
 
 async def main():
-    global stt, speaker, recorder, session_saved, git_safety, readonly_mode
+    global stt, speaker, recorder, session_saved, git_safety, \
+        readonly_mode, debug_mode, repo_root
 
     args = parse_args()
     repo_path = os.path.abspath(args.repo)
+    repo_root = repo_path  # confines auto-approved reads (permission callback)
 
     def load_stt():
         _load_audio()  # np is used below (and throughout the engines)
@@ -1355,7 +1490,7 @@ async def main():
     animate_banner()
 
     readonly_mode = args.readonly
-    globals()["debug_mode"] = args.debug
+    debug_mode = args.debug
 
     print(f"  {dim('model')} {args.model}   {dim('repo')} {repo_path}")
     print(f"  {dim('spoken transcript')} {dim(TRANSCRIPT_FILE)}")
@@ -1483,7 +1618,7 @@ async def main():
                 if audio is None:
                     continue
                 # A quick tap records only the pre-roll; too short to hold speech
-                if len(audio) < int(0.4 * SAMPLERATE):
+                if len(audio) < int(MIN_SPEECH_SECONDS * SAMPLERATE):
                     clear_status()
                     print(f"  {dim(f'(just a tap — hold {PTT_LABEL} down while you speak)')}")
                     continue
@@ -1542,7 +1677,7 @@ async def main():
                     answer = stt.transcribe(audio).lower() if audio is not None else ""
                     clear_status()
                     print(f"  {cyan('You »')} {answer.strip() or '(no answer)'}")
-                    if any(w in answer for w in ["yes", "yeah", "sure", "go ahead", "okay", "ok"]):
+                    if is_affirmative(answer):
                         outcome = git_safety.commit(subject)
                         print(f"  {green(CHECK)} {dim(outcome)}")
                         speaker.say(outcome)

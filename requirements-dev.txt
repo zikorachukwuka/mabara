@@ -1,0 +1,3 @@
+# Dev-only tooling (not part of the runtime lock; install separately):
+#   pip install -r requirements-dev.txt
+pytest==9.1.1

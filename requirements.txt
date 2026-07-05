@@ -1,3 +1,7 @@
+# Direct dependencies, human-readable. For a supply-chain-verified install
+# use the fully-resolved lock instead:
+#   pip install --require-hashes -r requirements.lock
+
 # Core
 claude-agent-sdk==0.2.110   # Claude brain (needs Claude Code CLI installed + logged in)
 sounddevice==0.5.5          # mic + speaker streams
