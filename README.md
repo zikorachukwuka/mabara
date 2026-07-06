@@ -41,7 +41,7 @@ https://github.com/user-attachments/assets/f56e96d3-158f-4065-9ca9-bbbf9585a301
   ♪ …the comment is in — want me to run the build?   ← live subtitle
 ```
 
-The terminal shows **artifacts, not prose**: your words, tool actions, code blocks, approvals, receipts. What Mabara *says* plays as audio with a one-line live subtitle — the full transcript lands in a log file. Voice is the interface; the screen is the instrument panel.
+The terminal shows **artifacts, not prose**: your words, tool actions, code blocks, approvals, receipts. What Mabara *says* plays as audio with a one-line live subtitle; the full transcript lands in a log file. Voice is the interface; the screen is the instrument panel.
 
 ## Setup
 
@@ -136,7 +136,7 @@ One Python file, one process, five threads, no framework. That's deliberate: a r
 
 ## The decision log (why each part is what it is)
 
-Every component was chosen by benchmark on the target machine — and several "obvious" choices lost. Real numbers, measured 2026-07-04 on an i5-10210U:
+Every component was chosen by benchmark on the target machine, and several "obvious" choices lost. Real numbers, measured 2026-07-04 on an i5-10210U:
 
 ### Ears: Whisper → Parakeet
 
@@ -154,7 +154,7 @@ Distil-Whisper's headline speedups never materialized for push-to-talk: short cl
 |---|---|---|
 | Kokoro (PyTorch) | 1.4× | most natural, can't keep up |
 | Kokoro (fp32 ONNX + misaki G2P) | 1.6× | still knife-edge; gaps between sentences |
-| Kokoro (**int8** ONNX) | **0.6×** | *slower* than fp32 — this CPU has no VNNI |
+| Kokoro (**int8** ONNX) | **0.6×** | *slower* than fp32; this CPU has no VNNI |
 | Supertonic M1 (66M flow matching) | 2.1–4.2× | near-Kokoro quality, but ~1.6s to first word |
 | **Piper joe-medium** | **~7×** | robotic edge, **0.4s to first word** - wins |
 
@@ -176,25 +176,25 @@ The local pipeline is squeezed to near its physical floor; what remains is the m
 
 ## Development
 
-Unit tests cover the safety-critical parsing — spoken approval answers, the read-only shell allowlist, repo confinement, the permission policy, and the voice-command matchers:
+Unit tests cover the safety-critical parsing: spoken approval answers, the read-only shell allowlist, repo confinement, the permission policy, and the voice-command matchers:
 
 ```powershell
 venv\Scripts\pip install -r requirements-dev.txt
 venv\Scripts\python -m pytest tests
 ```
 
-The manual hardware checks (mic, hotkey, STT, SDK connectivity) live in [scripts/](scripts/) — they need a microphone and ears, so they're scripts, not tests.
+The manual hardware checks (mic, hotkey, STT, SDK connectivity) live in [scripts/](scripts/); they need a microphone and ears, so they're scripts, not tests.
 
 ## Security & privacy
 
 Things you should know before pointing Mabara at code:
 
 - **Approvals fail closed.** Spoken yes/no answers are parsed on whole words with deny-words checked first - "no, that looks broken" is a *no* (the letters "ok" inside a word never count as approval), "yes… wait, no" is a *no*, and silence or ambiguity is a *no*. An approval must also consist *entirely* of approval words: a question that happens to contain one ("okay, show me the diff first", "what will this do") is a *no*, not a yes. The parsing lives in `is_affirmative` and is unit-tested in `tests/`.
-- **Auto-approved reads stay inside the repo.** Read/Glob/Grep (and `cat`/`type`) on any path outside the `--repo` folder require a spoken yes — including Glob patterns that are absolute paths — so a prompt-injected "read `~/.ssh/id_rsa`" in someone else's repo can't sail through. The "yes for the whole task" grant is repo-confined the same way: an edit aimed outside the repo always comes back as a spoken question that says so. Still: **be deliberate about running any coding agent against untrusted repositories** - file *contents* inside the repo are read freely and sent to the Claude API. The whole permission policy is one pure function (`permission_decision`), unit-tested in `tests/`.
-- **The read-only shell allowlist is narrow.** Only exact whole-word commands (`ls`, `git status`, `git log`, …) with no chaining, redirection, or file-writing flags (`--output`) auto-run; everything else needs your voice. (The Claude CLI additionally runs its own read-only analysis and may auto-run commands it deems safe — like `cd repo && git status` — before Mabara is ever consulted; anything mutating still lands on voice approval.) In `--readonly` mode the mutating tools are removed from the toolset entirely, so no shell command runs at all.
+- **Auto-approved reads stay inside the repo.** Read/Glob/Grep (and `cat`/`type`) on any path outside the `--repo` folder require a spoken yes, including Glob patterns that are absolute paths, so a prompt-injected "read `~/.ssh/id_rsa`" in someone else's repo can't sail through. The "yes for the whole task" grant is repo-confined the same way: an edit aimed outside the repo always comes back as a spoken question that says so. Still: **be deliberate about running any coding agent against untrusted repositories** - file *contents* inside the repo are read freely and sent to the Claude API. The whole permission policy is one pure function (`permission_decision`), unit-tested in `tests/`.
+- **The read-only shell allowlist is narrow.** Only exact whole-word commands (`ls`, `git status`, `git log`, …) with no chaining, redirection, or file-writing flags (`--output`) auto-run; everything else needs your voice. (The Claude CLI additionally runs its own read-only analysis and may auto-run commands it deems safe, such as `cd repo && git status`, before Mabara is ever consulted; anything mutating still lands on voice approval.) In `--readonly` mode the mutating tools are removed from the toolset entirely, so no shell command runs at all.
 - **Transcripts are plaintext.** Everything both sides say lands in `data/transcripts.log` (rotated at 5 MB, one `.1` backup kept). It's gitignored, but treat it like a private notebook - anything Claude reads aloud, including code, ends up there.
-- **The `keyboard` dependency installs a global keyboard hook** (that's how push-to-talk works from any window). It requires root on Linux, and while Mabara only polls one key, you should know the hook sees all keystrokes while the process runs. It is also effectively unmaintained (no release since 2020) — a lot of trust for a package with that much access; the hash-pinned lockfile below keeps it at least byte-identical to what was audited at lock time.
-- **Dependencies are hash-pinned.** `requirements.lock` pins every package, including transitive ones, with sha256 hashes — `pip install --require-hashes -r requirements.lock` refuses anything PyPI didn't serve byte-for-byte at lock time.
+- **The `keyboard` dependency installs a global keyboard hook** (that's how push-to-talk works from any window). It requires root on Linux, and while Mabara only polls one key, you should know the hook sees all keystrokes while the process runs. It is also effectively unmaintained (no release since 2020), which is a lot of trust for a package with that much access; the hash-pinned lockfile below keeps it at least byte-identical to what was audited at lock time.
+- **Dependencies are hash-pinned.** `requirements.lock` pins every package, including transitive ones, with sha256 hashes, and `pip install --require-hashes -r requirements.lock` refuses anything PyPI didn't serve byte-for-byte at lock time.
 - **Git is resolved by absolute path at startup** and refused if it lives inside the target repo, so an untrusted repo can't plant its own `git.exe` (Windows searches the current directory for executables).
 
 ## Honest limitations
