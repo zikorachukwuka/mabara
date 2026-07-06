@@ -45,6 +45,8 @@ The terminal shows **artifacts, not prose**: your words, tool actions, code bloc
 
 ## Setup
 
+> **Windows only.** This setup reflects my own environment. The hotkey handling and console integration are Windows-tested; Linux and macOS are not supported without modifications.
+
 **Requirements:** Windows 10/11, Python 3.11+, a microphone, [Claude Code](https://claude.com/claude-code) installed and logged in (Mabara drives it through the Agent SDK), and git.
 
 ```powershell
