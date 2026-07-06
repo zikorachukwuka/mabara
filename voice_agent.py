@@ -617,23 +617,39 @@ def is_revert_command(text):
 
 _YES_WORDS = {
     "yes", "yeah", "yep", "yup", "sure", "okay", "ok", "go", "ahead",
-    "approve", "approved", "affirmative", "do",
+    "approve", "approved", "affirmative", "do", "alright", "fine",
+    "absolutely", "definitely", "course",
 }
 _NO_WORDS = {
     "no", "nope", "nah", "not", "don't", "dont", "stop", "deny", "denied",
     "decline", "cancel", "never", "negative", "wait", "hold",
 }
+# Words allowed to ride along with a yes word without breaking the approval
+# ("yes please do it", "yes for the whole task"). Anything outside this
+# vocabulary means the answer carries more than an approval — a question,
+# a condition, a new instruction — and the gate fails closed.
+_FILLER_WORDS = {
+    "please", "it", "it's", "that", "that's", "this", "them", "then",
+    "now", "the", "a", "for", "to", "of", "all", "whole", "task",
+    "everything",
+}
 
 
 def is_affirmative(answer):
     """Spoken yes/no for approvals. Matches whole words, never substrings
-    ('ok' must not fire inside 'look' or 'broken'), any deny word vetoes
-    the whole answer ('yes— wait, no' is a no), and anything ambiguous or
-    empty is a no: the gate in front of edits and commands fails closed."""
-    words = set(re.findall(r"[a-z']+", answer.lower()))
-    if words & _NO_WORDS:
+    ('ok' must not fire inside 'look' or 'broken'), and fails closed three
+    ways: any deny word vetoes the whole answer ('yes— wait, no' is a no);
+    the answer must contain a yes word; and every word must come from the
+    closed approval vocabulary, so a question or hesitation that happens to
+    contain a yes word ('what will this do', 'okay, show me the diff
+    first') never approves — the words outside the vocabulary prove the
+    answer is not just an approval."""
+    words = re.findall(r"[a-z']+", answer.lower())
+    if not words or set(words) & _NO_WORDS:
         return False
-    return bool(words & _YES_WORDS)
+    if not set(words) & _YES_WORDS:
+        return False
+    return all(w in _YES_WORDS or w in _FILLER_WORDS for w in words)
 
 
 _TASK_GRANT_WORDS = {"task", "everything", "all"}
@@ -740,6 +756,7 @@ class ParakeetSTT:
 
 def strip_markdown(text):
     """Remove common markdown so TTS doesn't stumble over symbols."""
+    text = re.sub(r'!?\[([^\]]*)\]\([^)]*\)', r'\1', text)    # links: keep text, drop URL
     text = re.sub(r'\*\*(.*?)\*\*', r'\1', text)              # bold
     text = re.sub(r'\*(.*?)\*', r'\1', text)                   # italic
     text = re.sub(r'`(.*?)`', r'\1', text)                     # inline code
@@ -1012,9 +1029,11 @@ READ_ONLY_BASH_PREFIXES = (
 
 
 # Chaining/redirection operators let a "read-only" prefix smuggle in writes
-# (e.g. "cat x; rm -rf ." or "echo hi > file"), so their presence disqualifies
-# a command from auto-approval regardless of how it starts.
-BASH_UNSAFE_PATTERN = re.compile(r"[;&|><`\n]|\$\(")
+# (e.g. "cat x; rm -rf ." or "echo hi > file"), and $ lets an auto-approved
+# echo expand env vars into the transcript ("echo $AWS_SECRET_ACCESS_KEY")
+# or run code ($(...)), so their presence disqualifies a command from
+# auto-approval regardless of how it starts.
+BASH_UNSAFE_PATTERN = re.compile(r"[;&|><`$\n]")
 
 # git log/diff write files via --output (and -o in some subcommands) with no
 # shell redirection involved. A false positive here just falls back to voice
@@ -1023,9 +1042,12 @@ BASH_WRITE_FLAG_PATTERN = re.compile(r"(^|\s)(-o|--output(-directory)?)(=|\s|$)"
 
 
 def _path_within(path, root):
-    """True if path resolves inside root (case-insensitive drive-safe)."""
-    target = os.path.normcase(os.path.abspath(path))
-    root = os.path.normcase(os.path.abspath(root))
+    """True if path resolves inside root (case-insensitive drive-safe).
+    realpath, not abspath: a symlink committed inside an untrusted repo
+    that points at, say, the home directory must not carry repo
+    confinement out with it."""
+    target = os.path.normcase(os.path.realpath(path))
+    root = os.path.normcase(os.path.realpath(root))
     try:
         return os.path.commonpath([target, root]) == root
     except ValueError:  # e.g. paths on different Windows drives
@@ -1041,6 +1063,18 @@ def _within_repo(path):
     if repo_root is None:
         return False
     return _path_within(os.path.expanduser(str(path)), repo_root)
+
+
+def _glob_pattern_prefix(pattern):
+    """The static directory prefix of an absolute Glob pattern, or None for
+    a relative one (relative patterns root at the tool cwd — the repo).
+    Without this, a Glob with an absolute pattern and no path key (e.g.
+    C:/Users/**/.ssh/*) would face no repo confinement at all: filenames,
+    not contents, but exactly the reconnaissance an injected prompt wants."""
+    pattern = os.path.expanduser(str(pattern))
+    if not os.path.isabs(pattern):
+        return None
+    return re.split(r"[*?\[]", pattern)[0] or pattern
 
 
 def _bash_arg_within_repo(token):
@@ -1186,10 +1220,15 @@ def spoken_command(command):
 
 
 def describe_action(tool_name, tool_input, spoken=False):
-    if tool_name == "Edit":
-        return f"edit the file {tool_input.get('file_path', 'unknown file')}"
-    if tool_name == "Write":
-        return f"write to the file {tool_input.get('file_path', 'unknown file')}"
+    if tool_name in ("Edit", "Write"):
+        # The spoken question shortens paths to their last component
+        # (speakable), so an out-of-repo target gets flagged in words —
+        # "bashrc" alone sounds exactly like a local file.
+        path = tool_input.get("file_path")
+        note = ("" if not path or _within_repo(path)
+                else ", which is outside this repo")
+        verb = "edit the file" if tool_name == "Edit" else "write to the file"
+        return f"{verb} {path or 'unknown file'}{note}"
     if tool_name == "Bash":
         command = tool_input.get("command", "unknown command")
         if spoken:
@@ -1198,8 +1237,9 @@ def describe_action(tool_name, tool_input, spoken=False):
     if tool_name in READ_ONLY_TOOLS:
         # Only reachable when the target is outside the repo — in-repo
         # reads were auto-approved before the question was ever asked.
+        # The pattern fallback covers Glob asked about an absolute pattern.
         target = (tool_input.get("file_path") or tool_input.get("path")
-                  or "an unknown path")
+                  or tool_input.get("pattern") or "an unknown path")
         return f"read {target}, which is outside this repo"
     return f"use the tool {tool_name}"
 
@@ -1289,66 +1329,103 @@ def print_command(command):
     print(dim(rule))
 
 
-async def voice_permission_callback(tool_name, tool_input, context):
-    global _approval_active, _task_approval
+READONLY_DENY = (
+    "This session is read-only: edits and commands are disabled. "
+    "Explain or show code instead of changing anything."
+)
+NO_GIT_DENY = (
+    "Edits are disabled: this folder is not a git repository, so "
+    "there is no safety net to undo changes. Tell the user that "
+    "running git init in this folder enables editing."
+)
 
+
+def permission_decision(tool_name, tool_input, *, readonly, task_approval,
+                        git_enabled):
+    """The policy core of voice_permission_callback, kept free of I/O and
+    mutable session state so tests can pin every branch of the most
+    security-critical decision in the project. Repo confinement still reads
+    module-level repo_root through the helpers. Returns one of:
+      ("allow", why)    — auto-approve; why in {"read", "bash", "task-grant"}
+      ("deny", message) — hard block; message goes back to the CLI
+      ("ask", None)     — fall through to the spoken approval flow
+    """
     # Reads are free — but only inside the session's repo. A prompt-injected
     # instruction in an untrusted repo ("read ~/.ssh/id_rsa") must land on
-    # the voice approval below, not sail through.
+    # the voice approval, not sail through. Glob is confined through its
+    # pattern too: an absolute pattern with no path key is the same probe.
     if tool_name in READ_ONLY_TOOLS:
         path = tool_input.get("file_path") or tool_input.get("path")
+        if path is None and tool_name == "Glob":
+            path = _glob_pattern_prefix(tool_input.get("pattern", ""))
         if _within_repo(path):
-            return PermissionResultAllow()
+            return ("allow", "read")
 
     # --readonly: a hard no for anything that changes state, regardless of
     # approvals — for exploring repos that must not be touched. Checked
     # before the read-only Bash allowlist so that, as the flag's help
     # promises, no shell command runs at all in a read-only session.
-    if readonly_mode and tool_name in ("Edit", "Write", "Bash"):
-        clear_status()
-        print(f"  {red('!')} {dim(describe_tool_use(tool_name, tool_input) + ' — blocked (read-only session)')}")
-        return PermissionResultDeny(message=(
-            "This session is read-only: edits and commands are disabled. "
-            "Explain or show code instead of changing anything."
-        ))
+    if readonly and tool_name in ("Edit", "Write", "Bash"):
+        return ("deny", READONLY_DENY)
 
-    if tool_name == "Bash" and is_read_only_bash(tool_input.get("command", "")):
-        return PermissionResultAllow()
+    if tool_name == "Bash" and is_read_only_bash(str(tool_input.get("command", ""))):
+        return ("allow", "bash")
 
     # No git, no edits: without a checkpoint to revert to, a bad edit by
-    # voice is unrecoverable. Claude relays this to the user out loud. The
-    # folder can BECOME a repo mid-session (the deny message itself says git
-    # init fixes the block), so re-check before denying — trusting the
-    # startup snapshot once sent the agent around the gate via a shell
-    # heredoc. The denial also prints: a blocked edit that leaves no mark
-    # looks exactly like a successful one in the tool feed.
-    if tool_name in ("Edit", "Write") and not git_safety.enabled:
-        if git_safety.recheck():
-            clear_status()
-            print(f"  {dim(f'{CHECK} git repository detected — edits enabled')}")
-        else:
-            clear_status()
-            print(f"  {red('!')} {dim(describe_tool_use(tool_name, tool_input) + ' — blocked: not a git repository')}")
-            return PermissionResultDeny(message=(
-                "Edits are disabled: this folder is not a git repository, so "
-                "there is no safety net to undo changes. Tell the user that "
-                "running git init in this folder enables editing."
-            ))
+    # voice is unrecoverable. Claude relays this to the user out loud.
+    if tool_name in ("Edit", "Write") and not git_enabled:
+        return ("deny", NO_GIT_DENY)
 
-    # "Yes, for the whole task" covers remaining edits this turn. Bash never
+    # "Yes, for the whole task" covers remaining edits this turn — but only
+    # inside the repo. The grant must not quietly widen into a license to
+    # write ~/.bashrc or a startup folder: an out-of-repo target goes back
+    # to a voice ask, where describe_action says so out loud. Bash never
     # auto-approves — commands are where the unrecoverable sharp edges are.
-    # The diff still prints when nobody is asked: an unseen edit is the
-    # fastest way to lose the room.
-    if tool_name in ("Edit", "Write") and _task_approval:
-        created = git_safety.before_mutation(tool_name, tool_input)
-        if created:
-            clear_status()
-            print(f"  {dim(CHECKPOINT_HINT)}")
-        diff = render_diff(tool_name, tool_input)
-        if diff:
-            print_diff(diff, tool_input.get("file_path", "?"))
-            print(f"  {dim('(auto-approved — whole-task grant)')}")
+    if (tool_name in ("Edit", "Write") and task_approval
+            and _within_repo(tool_input.get("file_path"))):
+        return ("allow", "task-grant")
+
+    return ("ask", None)
+
+
+async def voice_permission_callback(tool_name, tool_input, context):
+    global _approval_active, _task_approval
+
+    # The folder can BECOME a repo mid-session (the no-git deny message
+    # itself says git init fixes the block), so refresh git state before
+    # the policy reads it — trusting the startup snapshot once sent the
+    # agent around the gate via a shell heredoc.
+    if (tool_name in ("Edit", "Write") and not readonly_mode
+            and not git_safety.enabled and git_safety.recheck()):
+        clear_status()
+        print(f"  {dim(f'{CHECK} git repository detected — edits enabled')}")
+
+    verdict, detail = permission_decision(
+        tool_name, tool_input, readonly=readonly_mode,
+        task_approval=_task_approval, git_enabled=git_safety.enabled)
+
+    if verdict == "allow":
+        if detail == "task-grant":
+            # The diff still prints when nobody is asked: an unseen edit
+            # is the fastest way to lose the room.
+            created = git_safety.before_mutation(tool_name, tool_input)
+            if created:
+                clear_status()
+                print(f"  {dim(CHECKPOINT_HINT)}")
+            diff = render_diff(tool_name, tool_input)
+            if diff:
+                print_diff(diff, tool_input.get("file_path", "?"))
+                print(f"  {dim('(auto-approved — whole-task grant)')}")
         return PermissionResultAllow()
+
+    if verdict == "deny":
+        # The denial prints: a blocked edit that leaves no mark looks
+        # exactly like a successful one in the tool feed.
+        blocked = ("blocked (read-only session)" if detail == READONLY_DENY
+                   else "blocked: not a git repository")
+        clear_status()
+        print(f"  {red('!')} {dim(describe_tool_use(tool_name, tool_input) + ' — ' + blocked)}")
+        return PermissionResultDeny(message=detail)
 
     # Needs voice approval. The flag pauses the barge-in watcher (holding
     # the key here means "answering", not "cut Claude off"), and the blocking
@@ -1968,14 +2045,17 @@ async def main():
     # slow, and background agents finish between turns where nobody is
     # listening ("still waiting on that agent..."). Haiku especially
     # loves delegating trivial lookups to them.
-    disallowed = ["Task"]
+    # NotebookEdit is out entirely: the approval flow can't voice a
+    # notebook diff and GitSafety's revert doesn't track it — a tool the
+    # spoken UX can't honestly describe doesn't belong in the toolset.
+    disallowed = ["Task", "NotebookEdit"]
     if args.readonly:
         # The CLI auto-approves Bash it deems read-only (even compound
         # commands) without consulting can_use_tool, so the callback deny
         # alone cannot keep --readonly's promise that no shell command runs
         # at all. Remove the mutating tools from the toolset outright; the
         # callback deny stays as a second layer.
-        disallowed += ["Bash", "Edit", "Write", "NotebookEdit"]
+        disallowed += ["Bash", "Edit", "Write"]
     options = ClaudeAgentOptions(
         cwd=repo_path,
         model=args.model,

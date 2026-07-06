@@ -27,6 +27,11 @@ import voice_agent as va
     "go ahead",
     "sure, go ahead",
     "yes please do it",
+    "do it",
+    "go for it",
+    "of course",
+    "that's fine",
+    "yes for the whole task",
 ])
 def test_affirmative_answers_approve(answer):
     assert va.is_affirmative(answer)
@@ -53,6 +58,15 @@ def test_affirmative_answers_approve(answer):
     "",
     "hmm",
     "what does it change?",
+    # A yes word buried in a question or instruction must not approve:
+    # any word outside the closed approval vocabulary fails the gate
+    "what will this do",
+    "okay, show me the diff first",
+    "go back",
+    "do you mean the other file?",
+    "where does this go",
+    "sure, but explain it first",
+    "okay run all of them?",
 ])
 def test_non_affirmative_answers_deny(answer):
     assert not va.is_affirmative(answer)
@@ -99,6 +113,8 @@ def test_read_only_commands_are_allowed(repo, command):
     "ls && rm x",
     "cat `whoami`",
     "cat $(cmd)",
+    # $ expansion can leak env vars into the transcript
+    "echo $AWS_SECRET_ACCESS_KEY",
     "git status | sh",
     # git branch is a write op (create/force-move/delete), never read-only
     "git branch -D main",
@@ -150,6 +166,93 @@ def test_within_repo(repo):
     assert not va._within_repo(str(repo) + "-evil" + os.sep + "f.txt")
 
 
+def test_symlink_inside_repo_cannot_point_out(repo):
+    # A link committed in an untrusted repo aimed at the home directory
+    # must not carry repo confinement with it (realpath, not abspath).
+    link = repo / "innocent"
+    try:
+        os.symlink(os.path.expanduser("~"), str(link))
+    except OSError:
+        pytest.skip("symlink creation not permitted on this setup")
+    assert not va._within_repo(str(link / ".aws" / "credentials"))
+
+
+# ---------- Permission policy core (permission_decision) ----------
+
+def _decide(tool, tool_input, readonly=False, task_approval=False,
+            git_enabled=True):
+    return va.permission_decision(tool, tool_input, readonly=readonly,
+                                  task_approval=task_approval,
+                                  git_enabled=git_enabled)
+
+
+def test_reads_inside_repo_auto_approve(repo):
+    assert _decide("Read", {"file_path": str(repo / "a.py")}) == ("allow", "read")
+    assert _decide("Grep", {"pattern": "x", "path": str(repo)}) == ("allow", "read")
+    assert _decide("Glob", {"pattern": "**/*.py"}) == ("allow", "read")
+
+
+def test_reads_outside_repo_fall_to_voice_ask(repo):
+    assert _decide("Read", {
+        "file_path": os.path.expanduser("~/.aws/credentials")}) == ("ask", None)
+    assert _decide("Grep", {"pattern": "key", "path": str(repo.parent)}) == ("ask", None)
+
+
+def test_glob_absolute_pattern_cannot_escape_the_repo(repo):
+    # An absolute pattern with no path key used to bypass confinement
+    # entirely (_within_repo(None) is True) — filename reconnaissance
+    assert _decide("Glob", {"pattern": str(repo.parent / "**" / "*")}) == ("ask", None)
+    assert _decide("Glob", {"pattern": "~/.ssh/*"}) == ("ask", None)
+    assert _decide("Glob", {
+        "pattern": str(repo / "src" / "**" / "*.py")}) == ("allow", "read")
+
+
+def test_readonly_denies_mutating_tools_even_allowlisted_bash(repo):
+    for tool, tool_input in [("Edit", {"file_path": str(repo / "a.py")}),
+                             ("Write", {"file_path": str(repo / "a.py")}),
+                             ("Bash", {"command": "ls"})]:
+        assert _decide(tool, tool_input, readonly=True) == ("deny", va.READONLY_DENY)
+
+
+def test_bash_allowlist_allows_and_everything_else_asks(repo):
+    assert _decide("Bash", {"command": "git status"}) == ("allow", "bash")
+    assert _decide("Bash", {"command": "rm -rf ."}) == ("ask", None)
+
+
+def test_edits_denied_without_git(repo):
+    assert _decide("Edit", {"file_path": str(repo / "a.py")},
+                   git_enabled=False) == ("deny", va.NO_GIT_DENY)
+
+
+def test_whole_task_grant_is_repo_confined(repo):
+    inside = {"file_path": str(repo / "src" / "app.py")}
+    outside = {"file_path": os.path.expanduser("~/.bashrc")}
+    assert _decide("Edit", inside, task_approval=True) == ("allow", "task-grant")
+    # The grant must not widen into a license to write outside the repo:
+    # an out-of-repo target goes back to a voice ask
+    assert _decide("Edit", outside, task_approval=True) == ("ask", None)
+    assert _decide("Write", outside, task_approval=True) == ("ask", None)
+    # Without the grant, even in-repo edits ask
+    assert _decide("Edit", inside) == ("ask", None)
+
+
+def test_bash_never_rides_the_task_grant(repo):
+    assert _decide("Bash", {"command": "rm -rf ."}, task_approval=True) == ("ask", None)
+
+
+def test_unknown_tools_always_ask(repo):
+    assert _decide("NotebookEdit", {
+        "notebook_path": str(repo / "n.ipynb")}) == ("ask", None)
+
+
+def test_out_of_repo_edit_is_flagged_in_the_approval_question(repo):
+    inside = va.describe_action("Edit", {"file_path": str(repo / "a.py")})
+    assert "outside this repo" not in inside
+    outside = va.describe_action("Write", {
+        "file_path": os.path.expanduser("~/.bashrc")})
+    assert "outside this repo" in outside
+
+
 # ---------- Voice command matchers ----------
 
 def test_revert_command_matcher():
@@ -180,6 +283,12 @@ def test_strip_markdown():
     assert va.strip_markdown("**bold** and *italic* and `code`") == \
         "bold and italic and code"
     assert "##" not in va.strip_markdown("## Heading\ntext")
+
+
+def test_strip_markdown_links_speak_text_not_url():
+    assert va.strip_markdown("see [the docs](https://example.com/a/b) here") == \
+        "see the docs here"
+    assert va.strip_markdown("![diagram](img/arch.png)") == "diagram"
 
 
 def test_speakable_shortens_paths():
