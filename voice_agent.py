@@ -111,8 +111,10 @@ PIPER_LENGTH_SCALE = 0.95  # <1.0 speaks faster; stock pacing sounds drawly
 # survives 4 steps (4.2x) with little quality loss, so if speed is ever
 # needed again, drop SUPERTONIC_STEPS to 4.
 SUPERTONIC_VOICE = "M1"
-SUPERTONIC_STEPS = 4  # halves synthesis time vs 8; M1 holds up at 4, and it
-                      # cuts the silent gap before the first spoken word
+SUPERTONIC_STEPS = 5  # walked up from the 4-step floor: 5 beat both 4
+                      # (quality) and 6 (speed, with no clear quality win
+                      # over 5) on a live listen. Still short of Piper's
+                      # snappiness — under longer-term real-use review.
 SUPERTONIC_SPEED = 1.22  # >1 speaks faster; package default 1.05 felt slow
 
 
@@ -580,6 +582,22 @@ _MODEL_ALIASES = {
     "sonnet": "sonnet", "sonet": "sonnet", "sonnets": "sonnet",
     "haiku": "haiku", "opus": "opus",
 }
+
+
+def normalize_model_arg(raw):
+    """--model accepts a bare alias ('sonnet') — always resolving to
+    whatever that family's current default is — or a full model id
+    ('claude-sonnet-5') to pin an exact version. Only fixes up spelling of
+    the bare alias itself (e.g. 'sonet' -> 'sonnet'); a version number
+    appended to the word (e.g. 'sonnet5') is deliberately NOT stripped or
+    guessed at here, because 'which version is current' changes over time
+    and hardcoding it just goes stale the next time a model ships. That
+    ambiguity is instead caught and explained at startup, once, in
+    main() — see the --model validation right after parse_args()."""
+    key = raw.strip().lower()
+    return _MODEL_ALIASES.get(key, raw)
+
+
 _SWITCH_FILLER = {
     "switch", "use", "change", "to", "the", "model", "brain",
     "please", "now", "over",
@@ -1638,7 +1656,14 @@ def is_thinking_delta(message):
 # after you finish speaking reads as "it didn't hear me". Local TTS makes
 # this nearly free, and the real reply queues right behind it — so keep
 # every entry short enough to be done before the first streamed sentence.
-ACKNOWLEDGMENTS = ["On it.", "Okay.", "Let me look.", "Alright.", "One sec."]
+# Was briefly collapsed to one fixed phrase after "Let me look." here
+# collided with Claude's own "Let me see..." — but that was patching the
+# symptom. The real fix is the system prompt telling Claude to never lead
+# with a generic acknowledgment, since this line already covers that beat;
+# with collision handled at the source, variety is safe again. "Let me
+# look." stays retired from the pool regardless, since it's the one
+# phrasing most likely to echo Claude's own narration style.
+ACKNOWLEDGMENTS = ["On it.", "Okay.", "Alright.", "One sec.", "Got it."]
 
 # Stall watchdog thresholds. Normal first-token waits and auto-approved
 # tool runs sit well under half a minute on this machine — past that,
@@ -1968,6 +1993,19 @@ async def main():
         readonly_mode, debug_mode, repo_root
 
     args = parse_args()
+    args.model = normalize_model_arg(args.model)
+    if args.model not in _MODEL_ALIASES.values() and not args.model.startswith("claude-"):
+        # Anything else (e.g. a genuinely different pinned version like
+        # 'sonnet4.6') would otherwise sail through the whole STT/TTS/SDK
+        # load and only fail once the first query round-trips to the CLI —
+        # catch it here instead, before any of that work starts.
+        print(f"  {red('!')} Unrecognized --model '{args.model}'. Use a "
+              f"bare alias (sonnet, haiku, opus) to get that family's "
+              f"current default, or its exact full model id (e.g. "
+              f"claude-sonnet-5) to pin a specific version — a version "
+              f"number tacked onto the alias name isn't enough to tell "
+              f"which model you mean.")
+        return
     repo_path = os.path.abspath(args.repo)
     repo_root = repo_path  # confines auto-approved reads (permission callback)
 
@@ -2072,19 +2110,34 @@ async def main():
             "and commands go through a spoken approval step where the user "
             "answers yes or no out loud.\n\n"
             "How to speak: plain, natural, flowing sentences, like a capable "
-            "colleague talking while they work. Never use markdown, bullet "
-            "points, headers, bold, or tables — instead of a list, say "
-            "'first... second... and third...'. Answer questions at whatever "
-            "length they deserve; narrate work tersely. Refer to files by "
-            "their short name out loud ('page.tsx' or 'the chat route'), "
-            "never a full path — exact paths belong in [CODE] tags.\n\n"
+            "colleague talking while they work. Always use contractions — "
+            "it's, you'll, I've, don't, that's, we're — never the expanded "
+            "form. Keep sentences short with one idea each; three ideas "
+            "chained into a single sentence are hard to follow by ear. Let "
+            "a short sentence follow a longer one so the listener gets a "
+            "beat to absorb it. Never use parenthetical asides — if it's "
+            "worth saying, weave it into the sentence itself. Skip formal "
+            "transitions like 'additionally,' 'furthermore,' or 'it is "
+            "worth noting that' — just say 'and,' 'but,' 'so,' or 'also.' "
+            "Skip abbreviations like 'e.g.,' 'i.e.,' or 'etc.' — say 'for "
+            "example,' 'that is,' or 'and so on.' Never use markdown, "
+            "bullet points, headers, bold, or tables — instead of a list, "
+            "say 'first... second... and third...'. Answer questions at "
+            "whatever length they deserve; narrate work tersely. Refer to "
+            "files by their short name out loud ('page.tsx' or 'the chat "
+            "route'), never a full path — exact paths belong in [CODE] "
+            "tags.\n\n"
             "The ONLY exception is literal code: when exact code, a file "
             "path, or a diff genuinely matters, wrap ONLY that part in [CODE] "
             "and [/CODE] tags — it is shown on the user's screen, not spoken. "
             "Say out loud that you've put it on the screen; never read code "
             "aloud symbol by symbol. Keep [CODE] blocks minimal.\n\n"
-            "How to work: before any tool use, say one short sentence about "
-            "what you're about to do — never start with silent tool use; the "
+            "How to work: the app already speaks a short 'on it' the instant "
+            "your turn starts, so never open with a generic acknowledgment "
+            "like 'sure' or 'let me check that' — start your first sentence "
+            "with the specific thing you're doing or finding. Before any "
+            "tool use, say one short sentence about what you're about to "
+            "do — never start with silent tool use; the "
             "user is sitting in silence and can't see your tools running. "
             "During multi-step tasks, narrate each significant step in a "
             "sentence ('Found it — the default is wrong in parse_args. "

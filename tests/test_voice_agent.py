@@ -277,6 +277,22 @@ def test_model_switch_matcher():
     assert va.model_switch_target("tell me about opus") is None
 
 
+def test_normalize_model_arg():
+    # Only spelling of the bare alias is fixed up.
+    assert va.normalize_model_arg("sonnet") == "sonnet"
+    assert va.normalize_model_arg("Sonnet") == "sonnet"
+    assert va.normalize_model_arg("sonet") == "sonnet"
+    assert va.normalize_model_arg("opus") == "opus"
+    assert va.normalize_model_arg("claude-sonnet-5") == "claude-sonnet-5"
+    assert va.normalize_model_arg("claude-haiku-4-5-20251001") == "claude-haiku-4-5-20251001"
+    # A version number tacked onto the alias is ambiguous (which version?)
+    # and is deliberately left untouched — caught later by the startup
+    # validation in main(), not silently guessed at here.
+    assert va.normalize_model_arg("sonnet5") == "sonnet5"
+    assert va.normalize_model_arg("sonnet4.6") == "sonnet4.6"
+    assert va.normalize_model_arg("opus3") == "opus3"
+
+
 # ---------- TTS text cleanup ----------
 
 def test_strip_markdown():
