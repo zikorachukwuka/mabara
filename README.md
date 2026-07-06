@@ -4,10 +4,7 @@
 
 Built over a weekend of relentless benchmarking on a modest laptop (i5-10210U, 8 GB RAM, no GPU), Mabara turns Claude into a hands-free pair programmer: local ears, local mouth, cloud brain. Everything runs real-time on CPU.
 
-> 🎥 **Demo video coming here**
-
-<img width="954" height="479" alt="image" src="https://github.com/user-attachments/assets/cd491e58-d2d2-41bd-bfac-689f6dcfd857" />
-
+https://github.com/user-attachments/assets/f56e96d3-158f-4065-9ca9-bbbf9585a301
 
 ```
   __  __     _     ___     _     ___     _
@@ -44,6 +41,48 @@ Built over a weekend of relentless benchmarking on a modest laptop (i5-10210U, 8
 
 The terminal shows **artifacts, not prose**: your words, tool actions, code blocks, approvals, receipts. What Mabara *says* plays as audio with a one-line live subtitle — the full transcript lands in a log file. Voice is the interface; the screen is the instrument panel.
 
+## Setup
+
+**Requirements:** Windows 10/11, Python 3.11+, a microphone, [Claude Code](https://claude.com/claude-code) installed and logged in (Mabara drives it through the Agent SDK), and git.
+
+```powershell
+git clone https://github.com/zikorachukwuka/mabara
+cd mabara
+python -m venv venv
+venv\Scripts\pip install -r requirements.txt
+
+# — or, supply-chain-verified: every package (including transitive deps)
+#   pinned and sha256-checked against the versions this repo was built with
+venv\Scripts\pip install --require-hashes -r requirements.lock
+
+# Voice model (~60 MB, one time)
+venv\Scripts\python -m piper.download_voices en_US-joe-medium --download-dir models
+
+# First run downloads the speech-recognition model (~600 MB) to the HF cache
+$env:HF_HUB_OFFLINE = "0"
+venv\Scripts\python voice_agent.py --repo path\to\your\project
+```
+
+Optional PowerShell profile function, so any project folder is one word away:
+
+```powershell
+function mabara {
+    & "C:\path\to\mabara\venv\Scripts\python.exe" "C:\path\to\mabara\voice_agent.py" @args
+}
+```
+
+### Flags
+
+| Flag | Default | Notes |
+|---|---|---|
+| `--repo` | `.` | codebase to talk about (each repo gets a resumable session) |
+| `--model` | `sonnet` | alias or full model id; switchable by voice mid-session |
+| `--stt` | `parakeet` | or `small.en` / `base.en` (whisper fallbacks) |
+| `--tts` | `piper` | or `supertonic` (more natural, slower start) / `kokoro` |
+| `--voice` | `en_US-joe-medium` | piper voice (`hfc_male`, `amy` also good) |
+| `--readonly` | off | hard-disables edits and commands |
+| `--debug` | off | per-turn latency breakdown |
+
 ## Features
 
 - **Push-to-talk** (Right Ctrl) with an always-open mic and pre-roll buffer, so your first syllable is never clipped
@@ -53,6 +92,19 @@ The terminal shows **artifacts, not prose**: your words, tool actions, code bloc
 - **Git safety net** - edits only allowed inside a git repo; every edit-task gets an automatic checkpoint; **"revert that"** undoes the last task deterministically (including restoring your own untracked files rather than deleting them); **"commit this"** turns a finished task into a real commit - only the task's files, never your unrelated changes
 - **Dual-brain economics** - **"switch to haiku"** / **"switch to sonnet"** swaps the model *mid-conversation* with full context retained: quality by default, quota-stretching on demand
 - **Per-repo resumable sessions**, spoken error reporting (including usage-limit warnings with reset times), path-sanitized speech (you hear "page.tsx", never "C colon backslash..."), and a `--readonly` look-don't-touch mode
+
+## Voice commands
+
+| Say | Happens |
+|---|---|
+| *(anything else)* | goes to Claude |
+| "yes" / "no" | answer an approval |
+| "yes, for the whole task" | approve all remaining edits this task |
+| "revert that" | git-restore everything the last task touched |
+| "commit this" | commit the last task's files (voice-approved message) |
+| "switch to haiku / sonnet / opus" | swap model mid-conversation |
+
+Command matchers are deliberately narrow word-allowlists - "how do I undo a commit?" is conversation, "undo that" is a command.
 
 ## Architecture
 
@@ -118,64 +170,9 @@ Haiku answered ~2s faster and stretches subscription quota - but in live use it 
 
 The local pipeline is squeezed to near its physical floor; what remains is the model thinking. Also killed along the way: streaming transcription-while-talking (built for Whisper's 5s latency, removed when Parakeet made it pointless jitter) and DirectML iGPU offload (Kokoro's ConvTranspose crashes DML).
 
-## Voice commands
+## Development
 
-| Say | Happens |
-|---|---|
-| *(anything else)* | goes to Claude |
-| "yes" / "no" | answer an approval |
-| "yes, for the whole task" | approve all remaining edits this task |
-| "revert that" | git-restore everything the last task touched |
-| "commit this" | commit the last task's files (voice-approved message) |
-| "switch to haiku / sonnet / opus" | swap model mid-conversation |
-
-Command matchers are deliberately narrow word-allowlists - "how do I undo a commit?" is conversation, "undo that" is a command.
-
-## Setup
-
-**Requirements:** Windows 10/11, Python 3.11+, a microphone, [Claude Code](https://claude.com/claude-code) installed and logged in (Mabara drives it through the Agent SDK), and git.
-
-```powershell
-git clone https://github.com/zikorachukwuka/mabara
-cd mabara
-python -m venv venv
-venv\Scripts\pip install -r requirements.txt
-
-# — or, supply-chain-verified: every package (including transitive deps)
-#   pinned and sha256-checked against the versions this repo was built with
-venv\Scripts\pip install --require-hashes -r requirements.lock
-
-# Voice model (~60 MB, one time)
-venv\Scripts\python -m piper.download_voices en_US-joe-medium --download-dir models
-
-# First run downloads the speech-recognition model (~600 MB) to the HF cache
-$env:HF_HUB_OFFLINE = "0"
-venv\Scripts\python voice_agent.py --repo path\to\your\project
-```
-
-Optional PowerShell profile function, so any project folder is one word away:
-
-```powershell
-function mabara {
-    & "C:\path\to\mabara\venv\Scripts\python.exe" "C:\path\to\mabara\voice_agent.py" @args
-}
-```
-
-### Flags
-
-| Flag | Default | Notes |
-|---|---|---|
-| `--repo` | `.` | codebase to talk about (each repo gets a resumable session) |
-| `--model` | `sonnet` | alias or full model id; switchable by voice mid-session |
-| `--stt` | `parakeet` | or `small.en` / `base.en` (whisper fallbacks) |
-| `--tts` | `piper` | or `supertonic` (more natural, slower start) / `kokoro` |
-| `--voice` | `en_US-joe-medium` | piper voice (`hfc_male`, `amy` also good) |
-| `--readonly` | off | hard-disables edits and commands |
-| `--debug` | off | per-turn latency breakdown |
-
-### Development
-
-Unit tests cover the safety-critical parsing — spoken approval answers, the read-only shell allowlist, repo confinement, and the voice-command matchers:
+Unit tests cover the safety-critical parsing — spoken approval answers, the read-only shell allowlist, repo confinement, the permission policy, and the voice-command matchers:
 
 ```powershell
 venv\Scripts\pip install -r requirements-dev.txt
@@ -188,11 +185,11 @@ The manual hardware checks (mic, hotkey, STT, SDK connectivity) live in [scripts
 
 Things you should know before pointing Mabara at code:
 
-- **Approvals fail closed.** Spoken yes/no answers are parsed on whole words with deny-words checked first - "no, that looks broken" is a *no* (the letters "ok" inside a word never count as approval), "yes… wait, no" is a *no*, and silence or ambiguity is a *no*. The parsing lives in `is_affirmative` and is unit-tested in `tests/`.
-- **Auto-approved reads stay inside the repo.** Read/Glob/Grep (and `cat`/`type`) on any path outside the `--repo` folder require a spoken yes, so a prompt-injected "read `~/.ssh/id_rsa`" in someone else's repo can't sail through. Still: **be deliberate about running any coding agent against untrusted repositories** - file *contents* inside the repo are read freely and sent to the Claude API.
+- **Approvals fail closed.** Spoken yes/no answers are parsed on whole words with deny-words checked first - "no, that looks broken" is a *no* (the letters "ok" inside a word never count as approval), "yes… wait, no" is a *no*, and silence or ambiguity is a *no*. An approval must also consist *entirely* of approval words: a question that happens to contain one ("okay, show me the diff first", "what will this do") is a *no*, not a yes. The parsing lives in `is_affirmative` and is unit-tested in `tests/`.
+- **Auto-approved reads stay inside the repo.** Read/Glob/Grep (and `cat`/`type`) on any path outside the `--repo` folder require a spoken yes — including Glob patterns that are absolute paths — so a prompt-injected "read `~/.ssh/id_rsa`" in someone else's repo can't sail through. The "yes for the whole task" grant is repo-confined the same way: an edit aimed outside the repo always comes back as a spoken question that says so. Still: **be deliberate about running any coding agent against untrusted repositories** - file *contents* inside the repo are read freely and sent to the Claude API. The whole permission policy is one pure function (`permission_decision`), unit-tested in `tests/`.
 - **The read-only shell allowlist is narrow.** Only exact whole-word commands (`ls`, `git status`, `git log`, …) with no chaining, redirection, or file-writing flags (`--output`) auto-run; everything else needs your voice. (The Claude CLI additionally runs its own read-only analysis and may auto-run commands it deems safe — like `cd repo && git status` — before Mabara is ever consulted; anything mutating still lands on voice approval.) In `--readonly` mode the mutating tools are removed from the toolset entirely, so no shell command runs at all.
 - **Transcripts are plaintext.** Everything both sides say lands in `data/transcripts.log` (rotated at 5 MB, one `.1` backup kept). It's gitignored, but treat it like a private notebook - anything Claude reads aloud, including code, ends up there.
-- **The `keyboard` dependency installs a global keyboard hook** (that's how push-to-talk works from any window). It requires root on Linux, and while Mabara only polls one key, you should know the hook sees all keystrokes while the process runs.
+- **The `keyboard` dependency installs a global keyboard hook** (that's how push-to-talk works from any window). It requires root on Linux, and while Mabara only polls one key, you should know the hook sees all keystrokes while the process runs. It is also effectively unmaintained (no release since 2020) — a lot of trust for a package with that much access; the hash-pinned lockfile below keeps it at least byte-identical to what was audited at lock time.
 - **Dependencies are hash-pinned.** `requirements.lock` pins every package, including transitive ones, with sha256 hashes — `pip install --require-hashes -r requirements.lock` refuses anything PyPI didn't serve byte-for-byte at lock time.
 - **Git is resolved by absolute path at startup** and refused if it lives inside the target repo, so an untrusted repo can't plant its own `git.exe` (Windows searches the current directory for executables).
 
