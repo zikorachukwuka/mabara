@@ -1532,7 +1532,11 @@ async def voice_permission_callback(tool_name, tool_input, context):
                 question += (f" And {more} waiting — "
                              "you can say yes to all.")
                 print(f"  {dim(f'({queued} more {tool_name} queued — say yes to all to approve together)')}")
-            speaker.say(speakable(question + " Do you approve?"))
+            # The approval exchange is the most consequential dialogue in a
+            # session — it belongs in the transcript like any other speech.
+            spoken_question = speakable(question + " Do you approve?")
+            append_transcript("Mabara", spoken_question)
+            speaker.say(spoken_question)
             # Holding push-to-talk cuts the question short and answers right
             # away — nobody should sit through speech they've already read.
             await asyncio.to_thread(speaker.wait_or_interrupt)
@@ -1551,6 +1555,7 @@ async def voice_permission_callback(tool_name, tool_input, context):
             answer = (await asyncio.to_thread(stt.transcribe, audio)).lower()
             clear_status()
             print(f"  {cyan('You »')} {answer.strip()}")
+            append_transcript("You", answer.strip())
 
             if is_affirmative(answer):
                 created = (git_safety.before_mutation(tool_name, tool_input)
@@ -1566,16 +1571,19 @@ async def voice_permission_callback(tool_name, tool_input, context):
                         _task_grants.add(tool_name)
                         scope = f"{tool_name} calls"
                     print(f"  {green('approved')} {dim(f'— and auto-approving {scope} for the rest of this task')}")
-                    speaker.say("Okay — I'll handle the rest of those without asking.")
+                    confirmation = "Okay — I'll handle the rest of those without asking."
                 else:
                     print(f"  {green('approved')}")
-                    speaker.say("Okay, doing it now.")
+                    confirmation = "Okay, doing it now."
+                append_transcript("Mabara", confirmation)
+                speaker.say(confirmation)
                 if created:
                     print(f"  {dim(CHECKPOINT_HINT)}")
                 print()
                 return PermissionResultAllow()
             else:
                 print(f"  {dim('denied')}\n")
+                append_transcript("Mabara", "Okay, I won't do that.")
                 speaker.say("Okay, I won't do that.")
                 return PermissionResultDeny(message=(
                     "User declined via voice. Do not retry this tool call — "
