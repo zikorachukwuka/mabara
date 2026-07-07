@@ -186,13 +186,28 @@ _first_token_secs = None
 # Whether this conversation was saved for resume; read by the Ctrl+C handler
 session_saved = False
 
-# True while a voice approval is capturing the push-to-talk key, so the barge-in watcher
-# doesn't mistake the answer for "cut Claude off"
-_approval_active = False
+# Count of voice approvals in flight or queued, so the barge-in watcher
+# doesn't mistake an answer for "cut Claude off". Parallel tool calls make
+# the permission callback re-enter concurrently; a plain boolean here let
+# the first approval's cleanup unpause the watcher while a second was still
+# listening — the user's next press then became a brand-new task.
+_approvals_pending = 0
 
-# True after the user answers "yes, for the whole task": remaining Edit/Write
-# calls in the current task auto-approve (Bash always asks). Reset per turn.
-_task_approval = False
+# Serializes the spoken ask itself: one question, one mic, one answer at a
+# time. Without it, concurrent callbacks raced record_while_held on the
+# shared Recorder and clobbered each other's frames — an approval could be
+# denied with "no answer" before the user had any chance to give one.
+_approval_lock = asyncio.Lock()
+
+# Queued asks per tool name, so the spoken question can offer "yes to all"
+# when more calls of the same tool are waiting behind the current one.
+_pending_asks = {}
+
+# Whole-task grants, cleared when the task ends. "Yes for the whole task"
+# during an Edit/Write approval adds "edits" (covers both, repo-confined);
+# during any other tool's approval it adds that tool's name, so a task that
+# needs five web searches needs one yes, not five. Bash never rides a grant.
+_task_grants = set()
 
 
 # ---------- CLI args ----------
@@ -650,6 +665,10 @@ _FILLER_WORDS = {
     "please", "it", "it's", "that", "that's", "this", "them", "then",
     "now", "the", "a", "for", "to", "of", "all", "whole", "task",
     "everything",
+    # First-person approvals: "yes, I approve", "I said yes". Without
+    # these, the most natural way to say yes failed the closed-vocabulary
+    # gate and was denied — observed live, twice in one approval storm.
+    "i", "i'm", "said",
 }
 
 
@@ -1176,7 +1195,7 @@ BASH_OK_MARKER_SECS = 2.5
 # approval flow, gate denials (read-only, no-git) right in the callback — so
 # a second 'failed' marker for the same event would read as two failures.
 # These match the deny messages this file itself sends back to the CLI.
-_DENIAL_MARKERS = ("declined", "no response captured", "read-only", "disabled")
+_DENIAL_MARKERS = ("declined", "no answer was captured", "read-only", "disabled")
 
 
 def _tool_result_text(content):
@@ -1358,12 +1377,14 @@ NO_GIT_DENY = (
 )
 
 
-def permission_decision(tool_name, tool_input, *, readonly, task_approval,
+def permission_decision(tool_name, tool_input, *, readonly, task_grants,
                         git_enabled):
     """The policy core of voice_permission_callback, kept free of I/O and
     mutable session state so tests can pin every branch of the most
-    security-critical decision in the project. Repo confinement still reads
-    module-level repo_root through the helpers. Returns one of:
+    security-critical decision in the project. task_grants is the set of
+    whole-task grants in force ("edits" or a tool name — see _task_grants).
+    Repo confinement still reads module-level repo_root through the
+    helpers. Returns one of:
       ("allow", why)    — auto-approve; why in {"read", "bash", "task-grant"}
       ("deny", message) — hard block; message goes back to the CLI
       ("ask", None)     — fall through to the spoken approval flow
@@ -1399,15 +1420,20 @@ def permission_decision(tool_name, tool_input, *, readonly, task_approval,
     # write ~/.bashrc or a startup folder: an out-of-repo target goes back
     # to a voice ask, where describe_action says so out loud. Bash never
     # auto-approves — commands are where the unrecoverable sharp edges are.
-    if (tool_name in ("Edit", "Write") and task_approval
+    if (tool_name in ("Edit", "Write") and "edits" in task_grants
             and _within_repo(tool_input.get("file_path"))):
+        return ("allow", "task-grant")
+
+    # A grant given on any other tool covers only that tool, by name — a
+    # yes-to-all on web searches must not leak into anything mutating.
+    if tool_name not in ("Bash", "Edit", "Write") and tool_name in task_grants:
         return ("allow", "task-grant")
 
     return ("ask", None)
 
 
 async def voice_permission_callback(tool_name, tool_input, context):
-    global _approval_active, _task_approval
+    global _approvals_pending
 
     # The folder can BECOME a repo mid-session (the no-git deny message
     # itself says git init fixes the block), so refresh git state before
@@ -1418,14 +1444,16 @@ async def voice_permission_callback(tool_name, tool_input, context):
         clear_status()
         print(f"  {dim(f'{CHECK} git repository detected — edits enabled')}")
 
-    verdict, detail = permission_decision(
-        tool_name, tool_input, readonly=readonly_mode,
-        task_approval=_task_approval, git_enabled=git_safety.enabled)
+    def decide():
+        return permission_decision(
+            tool_name, tool_input, readonly=readonly_mode,
+            task_grants=_task_grants, git_enabled=git_safety.enabled)
 
-    if verdict == "allow":
-        if detail == "task-grant":
-            # The diff still prints when nobody is asked: an unseen edit
-            # is the fastest way to lose the room.
+    def allow_by_grant():
+        # The diff still prints when nobody is asked: an unseen edit
+        # is the fastest way to lose the room. Only mutating tools take
+        # a checkpoint — a web search has nothing to revert.
+        if tool_name in ("Edit", "Write"):
             created = git_safety.before_mutation(tool_name, tool_input)
             if created:
                 clear_status()
@@ -1436,7 +1464,7 @@ async def voice_permission_callback(tool_name, tool_input, context):
                 print(f"  {dim('(auto-approved — whole-task grant)')}")
         return PermissionResultAllow()
 
-    if verdict == "deny":
+    def deny_by_policy(detail):
         # The denial prints: a blocked edit that leaves no mark looks
         # exactly like a successful one in the tool feed.
         blocked = ("blocked (read-only session)" if detail == READONLY_DENY
@@ -1445,68 +1473,117 @@ async def voice_permission_callback(tool_name, tool_input, context):
         print(f"  {red('!')} {dim(describe_tool_use(tool_name, tool_input) + ' — ' + blocked)}")
         return PermissionResultDeny(message=detail)
 
-    # Needs voice approval. The flag pauses the barge-in watcher (holding
-    # the key here means "answering", not "cut Claude off"), and the blocking
-    # calls run in threads so the SDK's control protocol stays responsive
-    # while we talk and listen.
-    _approval_active = True
+    verdict, detail = decide()
+    if verdict == "allow":
+        return allow_by_grant() if detail == "task-grant" else PermissionResultAllow()
+    if verdict == "deny":
+        return deny_by_policy(detail)
+
+    # Needs voice approval. Parallel tool calls re-enter this callback
+    # concurrently, so the ask itself is serialized: one question, one mic,
+    # one answer at a time. The pending counter (not a boolean — every
+    # queued ask holds a reference) pauses the barge-in watcher for the
+    # whole queue, so an answer is never mistaken for "cut Claude off".
+    # Blocking calls run in threads so the SDK's control protocol stays
+    # responsive while we talk and listen.
+    _approvals_pending += 1
+    _pending_asks[tool_name] = _pending_asks.get(tool_name, 0) + 1
     try:
-        stop_thinking()
-        command = str(tool_input.get("command", "")) if tool_name == "Bash" else ""
-        if "\n" in command.strip():
-            # Multi-line commands get the framed, truncated treatment —
-            # never a raw flood inside the approval banner.
-            print(f"\n\n  {yellow('! approval needed')} — Mabara wants to run this command:")
-            print_command(command)
-        else:
-            print(f"\n\n  {yellow('! approval needed')} — Mabara wants to {describe_action(tool_name, tool_input)}")
-        # Show the red/green before the yes/no — approving a change you
-        # haven't seen is the biggest trust gap a coding tool can have.
-        diff = (render_diff(tool_name, tool_input)
-                if tool_name in ("Edit", "Write") else None)
-        if diff:
-            print_diff(diff, tool_input.get("file_path", "?"))
-        question = f"I'd like to {describe_action(tool_name, tool_input, spoken=True)}."
-        if diff:
-            question += " The diff is on your screen."
-        speaker.say(speakable(question + " Do you approve?"))
-        # Holding push-to-talk cuts the question short and answers right
-        # away — nobody should sit through speech they've already read.
-        await asyncio.to_thread(speaker.wait_or_interrupt)
+        async with _approval_lock:
+            # Parallel calls arrive as separate control messages a beat
+            # apart; a short settle lets the whole batch register in
+            # _pending_asks so the question can offer "yes to all" —
+            # invisible next to the seconds of TTS synthesis that follow.
+            await asyncio.sleep(0.1)
+            # An answer given while this call waited in the queue may
+            # already cover it — "yes to all" on the first of five web
+            # searches approves the other four right here.
+            verdict, detail = decide()
+            if verdict == "allow":
+                return allow_by_grant() if detail == "task-grant" else PermissionResultAllow()
+            if verdict == "deny":
+                return deny_by_policy(detail)
 
-        audio = await asyncio.to_thread(
-            recorder.record_while_held, f"hold {PTT_LABEL} to answer (yes / no)"
-        )
-        if audio is None:
-            clear_status()
-            print(f"  {dim('no answer — denied')}\n")
-            return PermissionResultDeny(message="No response captured")
-
-        answer = (await asyncio.to_thread(stt.transcribe, audio)).lower()
-        clear_status()
-        print(f"  {cyan('You »')} {answer.strip()}")
-
-        if is_affirmative(answer):
-            created = git_safety.before_mutation(tool_name, tool_input)
-            # "yes for the whole task" / "yes to all" widens the grant to
-            # every remaining edit in this task
-            if grants_whole_task(answer):
-                _task_approval = True
-                print(f"  {green('approved')} {dim('— and auto-approving edits for the rest of this task')}")
-                speaker.say("Okay — I'll handle the rest of this task's edits without asking.")
+            stop_thinking()
+            command = str(tool_input.get("command", "")) if tool_name == "Bash" else ""
+            if "\n" in command.strip():
+                # Multi-line commands get the framed, truncated treatment —
+                # never a raw flood inside the approval banner.
+                print(f"\n\n  {yellow('! approval needed')} — Mabara wants to run this command:")
+                print_command(command)
             else:
-                print(f"  {green('approved')}")
-                speaker.say("Okay, doing it now.")
-            if created:
-                print(f"  {dim(CHECKPOINT_HINT)}")
-            print()
-            return PermissionResultAllow()
-        else:
-            print(f"  {dim('denied')}\n")
-            speaker.say("Okay, I won't do that.")
-            return PermissionResultDeny(message="User declined via voice")
+                print(f"\n\n  {yellow('! approval needed')} — Mabara wants to {describe_action(tool_name, tool_input)}")
+            # Show the red/green before the yes/no — approving a change you
+            # haven't seen is the biggest trust gap a coding tool can have.
+            diff = (render_diff(tool_name, tool_input)
+                    if tool_name in ("Edit", "Write") else None)
+            if diff:
+                print_diff(diff, tool_input.get("file_path", "?"))
+            question = f"I'd like to {describe_action(tool_name, tool_input, spoken=True)}."
+            if diff:
+                question += " The diff is on your screen."
+            # More of the same tool waiting behind this one? Offer the
+            # batch out loud — nobody should learn about 'yes to all' from
+            # the README mid-approval-storm.
+            queued = _pending_asks.get(tool_name, 1) - 1
+            if queued and tool_name not in ("Bash", "Edit", "Write"):
+                more = ("one more like it is" if queued == 1
+                        else f"{queued} more like it are")
+                question += (f" And {more} waiting — "
+                             "you can say yes to all.")
+                print(f"  {dim(f'({queued} more {tool_name} queued — say yes to all to approve together)')}")
+            speaker.say(speakable(question + " Do you approve?"))
+            # Holding push-to-talk cuts the question short and answers right
+            # away — nobody should sit through speech they've already read.
+            await asyncio.to_thread(speaker.wait_or_interrupt)
+
+            audio = await asyncio.to_thread(
+                recorder.record_while_held, f"hold {PTT_LABEL} to answer (yes / no)"
+            )
+            if audio is None:
+                clear_status()
+                print(f"  {dim('no answer — denied')}\n")
+                return PermissionResultDeny(message=(
+                    "No answer was captured from the user — the microphone "
+                    "heard nothing, so this is not a refusal. If the call "
+                    "still matters, tell the user and request it once more."))
+
+            answer = (await asyncio.to_thread(stt.transcribe, audio)).lower()
+            clear_status()
+            print(f"  {cyan('You »')} {answer.strip()}")
+
+            if is_affirmative(answer):
+                created = (git_safety.before_mutation(tool_name, tool_input)
+                           if tool_name in ("Bash", "Edit", "Write") else False)
+                # "yes for the whole task" / "yes to all" widens the grant:
+                # on an edit, to every remaining edit this task; on any
+                # other tool, to that tool's remaining calls this task.
+                if grants_whole_task(answer):
+                    if tool_name in ("Edit", "Write"):
+                        _task_grants.add("edits")
+                        scope = "edits"
+                    else:
+                        _task_grants.add(tool_name)
+                        scope = f"{tool_name} calls"
+                    print(f"  {green('approved')} {dim(f'— and auto-approving {scope} for the rest of this task')}")
+                    speaker.say("Okay — I'll handle the rest of those without asking.")
+                else:
+                    print(f"  {green('approved')}")
+                    speaker.say("Okay, doing it now.")
+                if created:
+                    print(f"  {dim(CHECKPOINT_HINT)}")
+                print()
+                return PermissionResultAllow()
+            else:
+                print(f"  {dim('denied')}\n")
+                speaker.say("Okay, I won't do that.")
+                return PermissionResultDeny(message=(
+                    "User declined via voice. Do not retry this tool call — "
+                    "if you can't proceed without it, ask the user what "
+                    "they'd like instead."))
     finally:
-        _approval_active = False
+        _approvals_pending -= 1
+        _pending_asks[tool_name] -= 1
         start_thinking()
 
 
@@ -1688,8 +1765,8 @@ async def ask_claude(client, text, speaker, label=None):
     stops and the model stops generating. `label` is the user's own words,
     printed as the task header when tools start running.
     Returns (session_id, barged_in, streamer, tool_calls, result_error)."""
-    global _task_approval, _first_token_secs
-    _task_approval = False  # a whole-task grant never outlives its task
+    global _first_token_secs
+    _task_grants.clear()  # a whole-task grant never outlives its task
     _first_token_secs = None
     query_started = time.time()
     ack = random.choice(ACKNOWLEDGMENTS)
@@ -1707,7 +1784,7 @@ async def ask_claude(client, text, speaker, label=None):
     async def watch_for_barge_in():
         nonlocal barged_in
         while True:
-            if not _approval_active and ptt_pressed():
+            if not _approvals_pending and ptt_pressed():
                 barged_in = True
                 speaker.interrupt()
                 try:
@@ -1728,7 +1805,7 @@ async def ask_claude(client, text, speaker, label=None):
             await asyncio.sleep(1.0)
             if barged_in:
                 return
-            if _approval_active:
+            if _approvals_pending:
                 # The stream is waiting on the user's yes/no, not hung
                 last_event = time.time()
                 continue
@@ -1806,7 +1883,7 @@ async def ask_claude(client, text, speaker, label=None):
         watcher.cancel()
         stall_watcher.cancel()
         stop_thinking()
-        _task_approval = False
+        _task_grants.clear()
     if not barged_in:
         streamer.finish()
     else:
@@ -1893,7 +1970,7 @@ TIPS = [
     f"hold {PTT_LABEL} for your whole sentence — release to send",
     f"I talk too much? hold {PTT_LABEL} to cut me off and take over",
     "I never edit or run anything until you say yes out loud",
-    "answer 'yes for the whole task' to approve all its edits at once",
+    "answer 'yes to all' to approve a task's repeated asks in one go",
     "said yes and regret it? just say 'revert that'",
     "happy with a task? say 'commit this' to make it a git commit",
     "say 'switch to sonnet' for hard tasks, 'switch to haiku' for speed",
@@ -2147,7 +2224,12 @@ async def main():
             "change. For work spanning several files, say the plan out loud "
             "in a sentence or two before you start, and mention that they "
             "can approve edits one by one or say 'yes for the whole task' "
-            "to approve them all at once. Always do the work yourself with "
+            "to approve them all at once. The same goes for repeated calls "
+            "of one tool, like several web searches: approvals are asked "
+            "one at a time, so say up front how many you plan and that "
+            "'yes to all' approves the rest in one go. If an approval "
+            "comes back denied because the user declined, never retry the "
+            "same call — ask them what they'd like instead. Always do the work yourself with "
             "your own tools, in this turn — never launch agents or "
             "background tasks: the user is on a live voice call with you "
             "and anything that finishes 'later' finishes never.\n\n"

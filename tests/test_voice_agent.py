@@ -32,6 +32,11 @@ import voice_agent as va
     "of course",
     "that's fine",
     "yes for the whole task",
+    # First-person phrasing — the natural spoken yes must not fail the
+    # closed-vocabulary gate (it did, live, mid approval storm)
+    "yes, i approve.",
+    "i said i approve, yes.",
+    "i said yes",
 ])
 def test_affirmative_answers_approve(answer):
     assert va.is_affirmative(answer)
@@ -179,10 +184,10 @@ def test_symlink_inside_repo_cannot_point_out(repo):
 
 # ---------- Permission policy core (permission_decision) ----------
 
-def _decide(tool, tool_input, readonly=False, task_approval=False,
+def _decide(tool, tool_input, readonly=False, task_grants=frozenset(),
             git_enabled=True):
     return va.permission_decision(tool, tool_input, readonly=readonly,
-                                  task_approval=task_approval,
+                                  task_grants=task_grants,
                                   git_enabled=git_enabled)
 
 
@@ -227,17 +232,35 @@ def test_edits_denied_without_git(repo):
 def test_whole_task_grant_is_repo_confined(repo):
     inside = {"file_path": str(repo / "src" / "app.py")}
     outside = {"file_path": os.path.expanduser("~/.bashrc")}
-    assert _decide("Edit", inside, task_approval=True) == ("allow", "task-grant")
+    grants = {"edits"}
+    assert _decide("Edit", inside, task_grants=grants) == ("allow", "task-grant")
     # The grant must not widen into a license to write outside the repo:
     # an out-of-repo target goes back to a voice ask
-    assert _decide("Edit", outside, task_approval=True) == ("ask", None)
-    assert _decide("Write", outside, task_approval=True) == ("ask", None)
+    assert _decide("Edit", outside, task_grants=grants) == ("ask", None)
+    assert _decide("Write", outside, task_grants=grants) == ("ask", None)
     # Without the grant, even in-repo edits ask
     assert _decide("Edit", inside) == ("ask", None)
 
 
 def test_bash_never_rides_the_task_grant(repo):
-    assert _decide("Bash", {"command": "rm -rf ."}, task_approval=True) == ("ask", None)
+    # Neither the edits grant nor even its own name lets Bash through
+    assert _decide("Bash", {"command": "rm -rf ."},
+                   task_grants={"edits"}) == ("ask", None)
+    assert _decide("Bash", {"command": "rm -rf ."},
+                   task_grants={"Bash"}) == ("ask", None)
+
+
+def test_tool_grant_covers_only_that_tool(repo):
+    # "Yes to all" on a web search covers the task's remaining searches...
+    assert _decide("WebSearch", {"query": "x"},
+                   task_grants={"WebSearch"}) == ("allow", "task-grant")
+    # ...but not other tools, and never edits
+    assert _decide("WebFetch", {"url": "https://x"},
+                   task_grants={"WebSearch"}) == ("ask", None)
+    assert _decide("Edit", {"file_path": str(repo / "a.py")},
+                   task_grants={"WebSearch", "Edit"}) == ("ask", None)
+    # Without a grant, searches still ask every time
+    assert _decide("WebSearch", {"query": "x"}) == ("ask", None)
 
 
 def test_unknown_tools_always_ask(repo):
@@ -379,10 +402,15 @@ def test_read_failures_stay_silent():
 
 
 def test_denials_do_not_double_report():
-    pending = {"t3": ("Bash", 0.0)}
-    assert va.describe_tool_outcome(
-        _Block("t3", is_error=True, content="User declined via voice"),
-        pending) is None
+    for message in [
+        "User declined via voice. Do not retry this tool call — if you "
+        "can't proceed without it, ask the user what they'd like instead.",
+        "No answer was captured from the user — the microphone heard "
+        "nothing, so this is not a refusal.",
+    ]:
+        assert va.describe_tool_outcome(
+            _Block("t3", is_error=True, content=message),
+            {"t3": ("Bash", 0.0)}) is None
 
 
 def test_fast_bash_success_stays_silent():

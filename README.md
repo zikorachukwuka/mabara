@@ -92,7 +92,7 @@ function mabara {
 - **Push-to-talk** (Right Ctrl) with an always-open mic and pre-roll buffer, so your first syllable is never clipped
 - **Streaming speech** - Mabara starts talking after its first *sentence* is ready, not after the full response; sentences batch adaptively when synthesis needs headroom
 - **Barge-in** - hold the key while Mabara talks: playback stops within 0.2s, the model stops generating, and it's instantly listening to you
-- **Voice-gated tool safety** - reads are free; every edit and shell command is spoken aloud and requires your verbal "yes"; answering *"yes, for the whole task"* auto-approves the rest of that task's edits (shell commands always ask)
+- **Voice-gated tool safety** - reads are free; every edit and shell command is spoken aloud and requires your verbal "yes", asked one at a time even when Claude queues several tool calls at once; answering *"yes, for the whole task"* auto-approves the rest of that task's edits, and *"yes to all"* during a repeated ask (say, several web searches) covers the rest of that tool's calls (shell commands always ask)
 - **Git safety net** - edits only allowed inside a git repo; every edit-task gets an automatic checkpoint; **"revert that"** undoes the last task deterministically (including restoring your own untracked files rather than deleting them); **"commit this"** turns a finished task into a real commit - only the task's files, never your unrelated changes
 - **Dual-brain economics** - **"switch to haiku"** / **"switch to sonnet"** swaps the model *mid-conversation* with full context retained: quality by default, quota-stretching on demand
 - **Per-repo resumable sessions**, spoken error reporting (including usage-limit warnings with reset times), path-sanitized speech (you hear "page.tsx", never "C colon backslash..."), and a `--readonly` look-don't-touch mode
@@ -104,6 +104,7 @@ function mabara {
 | *(anything else)* | goes to Claude |
 | "yes" / "no" | answer an approval |
 | "yes, for the whole task" | approve all remaining edits this task |
+| "yes to all" | approve the rest of a repeated ask (e.g. queued searches) |
 | "revert that" | git-restore everything the last task touched |
 | "commit this" | commit the last task's files (voice-approved message) |
 | "switch to haiku / sonnet / opus" | swap model mid-conversation |
