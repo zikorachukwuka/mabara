@@ -390,6 +390,76 @@ def test_render_diff_other_tools_are_none():
     assert va.render_diff("Bash", {"command": "ls"}) is None
 
 
+# ---------- Side-by-side review (press D during an edit approval) ----------
+
+def test_review_files_edit_reconstructs_whole_file(tmp_path):
+    p = tmp_path / "app.py"
+    p.write_text("a = 1\nb = 2\nc = 3\n", encoding="utf-8")
+    current, proposed, name = va.review_files("Edit", {
+        "file_path": str(p), "old_string": "b = 2", "new_string": "b = 20"})
+    assert current == "a = 1\nb = 2\nc = 3\n"
+    assert proposed == "a = 1\nb = 20\nc = 3\n"
+    assert name == "app.py"
+
+
+def test_review_files_edit_replace_all(tmp_path):
+    p = tmp_path / "x.txt"
+    p.write_text("y y y", encoding="utf-8")
+    _, proposed, _ = va.review_files("Edit", {
+        "file_path": str(p), "old_string": "y", "new_string": "z",
+        "replace_all": True})
+    assert proposed == "z z z"
+
+
+def test_review_files_write_new_file(tmp_path):
+    p = tmp_path / "new.md"
+    current, proposed, name = va.review_files("Write", {
+        "file_path": str(p), "content": "# hi\n"})
+    assert current == "" and proposed == "# hi\n" and name == "new.md"
+
+
+def test_review_files_unreconstructable_is_none(tmp_path):
+    p = tmp_path / "a.txt"
+    p.write_text("hello", encoding="utf-8")
+    # old_string not in the file: the outcome can't be shown honestly
+    assert va.review_files("Edit", {
+        "file_path": str(p), "old_string": "absent",
+        "new_string": "x"}) is None
+    # no-op Write and non-edit tools have nothing to review
+    assert va.review_files("Write", {
+        "file_path": str(p), "content": "hello"}) is None
+    assert va.review_files("Bash", {"command": "ls"}) is None
+    assert va.review_files("Edit", {"old_string": "a",
+                                    "new_string": "b"}) is None
+
+
+def test_open_review_writes_both_sides_and_launches(tmp_path, monkeypatch):
+    src = tmp_path / "page.tsx"
+    src.write_text("old\n", encoding="utf-8")
+    monkeypatch.setattr(va, "REVIEW_DIR", str(tmp_path / "review"))
+    monkeypatch.setattr(va, "_code_cli_cache", r"C:\fake\code.cmd")
+    launches = []
+    monkeypatch.setattr(va.subprocess, "Popen",
+                        lambda args, **kw: launches.append(args))
+    assert va.open_review("Write", {"file_path": str(src),
+                                    "content": "new\n"})
+    (args,) = launches
+    assert args[0] == r"C:\fake\code.cmd" and args[1] == "--diff"
+    with open(args[2], encoding="utf-8") as f:
+        assert f.read() == "old\n"       # left: the file as it is
+    with open(args[3], encoding="utf-8") as f:
+        assert f.read() == "new\n"       # right: the pending change
+    assert args[2].endswith("current-page.tsx")  # extension kept for colors
+
+
+def test_open_review_without_code_cli_is_false(tmp_path, monkeypatch):
+    src = tmp_path / "a.py"
+    src.write_text("x", encoding="utf-8")
+    monkeypatch.setattr(va, "_code_cli_cache", None)
+    assert not va.open_review("Write", {"file_path": str(src),
+                                        "content": "y"})
+
+
 # ---------- Tool outcome markers ----------
 
 class _Block:
@@ -523,12 +593,56 @@ def test_describe_action_spoken_variant_truncates_screen_does_not():
     assert "on your screen" in spoken
 
 
-def test_print_command_truncates_like_diffs(capsys):
+def test_print_command_truncates_like_diffs(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(va, "COMMAND_SPILL_FILE", str(tmp_path / "cmd.txt"))
     va.print_command("\n".join(f"line{i}" for i in range(60)))
     out = capsys.readouterr().out
     assert "line0" in out and "line39" in out
     assert "line45" not in out
     assert "+20 more lines" in out
+
+
+# ---------- Truncated previews spill their full text ----------
+
+def test_truncated_diff_spills_full_text_and_points_to_it(
+        tmp_path, monkeypatch, capsys):
+    spill = tmp_path / "last.diff"
+    monkeypatch.setattr(va, "DIFF_SPILL_FILE", str(spill))
+    lines = [f"+line{i}" for i in range(60)]
+    va.print_diff(lines, "app/page.tsx")
+    out = capsys.readouterr().out
+    assert "+20 more lines" in out
+    assert str(spill) in out            # the marker carries the path
+    assert spill.read_text(encoding="utf-8").splitlines() == lines
+
+
+def test_short_diff_spills_nothing(tmp_path, monkeypatch, capsys):
+    spill = tmp_path / "last.diff"
+    monkeypatch.setattr(va, "DIFF_SPILL_FILE", str(spill))
+    va.print_diff(["+one", "-two"], "app/page.tsx")
+    out = capsys.readouterr().out
+    assert "more lines" not in out
+    assert not spill.exists()
+
+
+def test_truncated_command_spills_verbatim(tmp_path, monkeypatch, capsys):
+    spill = tmp_path / "cmd.txt"
+    monkeypatch.setattr(va, "COMMAND_SPILL_FILE", str(spill))
+    command = "\n".join(f"line{i}" for i in range(60))
+    va.print_command(command)
+    out = capsys.readouterr().out
+    assert str(spill) in out
+    assert spill.read_text(encoding="utf-8") == command + "\n"
+
+
+def test_spill_failure_omits_pointer_not_the_preview(
+        tmp_path, monkeypatch, capsys):
+    bad = os.path.join(str(tmp_path), "missing-dir", "x.diff")
+    monkeypatch.setattr(va, "DIFF_SPILL_FILE", bad)
+    va.print_diff([f"+line{i}" for i in range(60)], "a.py")
+    out = capsys.readouterr().out
+    assert "+20 more lines" in out      # truncation marker survives
+    assert "missing-dir" not in out     # dead pointer is omitted
 
 
 # ---------- Tool feed honesty ----------

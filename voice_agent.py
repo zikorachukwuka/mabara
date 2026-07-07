@@ -1202,18 +1202,23 @@ class Recorder:
                 while self._preroll and self._preroll[0][0] < cutoff:
                     self._preroll.pop(0)
 
-    def record_while_held(self, prompt=None):
+    def record_while_held(self, prompt=None, review=None):
         # The bare between-turns idle doubles as the window for the last-
-        # reply fold-out; approval prompts (prompt=...) don't offer it.
+        # reply fold-out. Approval waits offer D = side-by-side instead,
+        # when the caller passes the pending (tool_name, tool_input).
         main_idle = prompt is None
         if prompt is None:
             prompt = f"hold {PTT_LABEL} to talk"
         status(dim(f"» {prompt}"))
         if main_idle:
             last_turn_view.drain()
+        elif review is not None:
+            terminal_focus.discard_keys()
         while not ptt_pressed():
             if main_idle:
                 last_turn_view.poll(prompt)
+            elif review is not None:
+                poll_review_key(review, prompt)
             time.sleep(0.01)
         if main_idle:
             last_turn_view.leave_idle()
@@ -1767,6 +1772,27 @@ DIFF_MAX_LINES = 40
 # Past this, diffing costs more than the glanceable record is worth.
 DIFF_MAX_SOURCE_CHARS = 200_000
 
+# Where a truncated approval preview's full text lands, so the "+N more
+# lines" marker can carry a clickable path instead of a dead end. .diff
+# gets red/green colorization when the editor opens it; the command file
+# is .txt on purpose — a click must never risk running it. Overwritten
+# per approval; the file outlives the answer, so what you said yes to
+# stays inspectable afterwards.
+DIFF_SPILL_FILE = os.path.join(DATA_DIR, "last-approval.diff")
+COMMAND_SPILL_FILE = os.path.join(DATA_DIR, "last-command.txt")
+
+
+def _spill(path, text):
+    """Write a preview's full text for the truncation pointer. Returns the
+    path, or None when the write failed (the pointer is simply omitted —
+    never block an approval over a bookkeeping file)."""
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text if text.endswith("\n") else text + "\n")
+        return path
+    except OSError:
+        return None
+
 CHECKPOINT_HINT = f"{CHECK} checkpoint saved — say 'revert that' to undo"
 
 
@@ -1826,7 +1852,11 @@ def print_diff(lines, path):
         else:
             print(line)
     if len(lines) > len(shown):
-        print(dim(f"... +{len(lines) - len(shown)} more lines"))
+        more = f"... +{len(lines) - len(shown)} more lines"
+        spill = _spill(DIFF_SPILL_FILE, "\n".join(lines))
+        if spill:
+            more += f" {TOOL_MARK} {spill} (ctrl+click to read it all)"
+        print(dim(more))
     print(dim(rule))
 
 
@@ -1842,8 +1872,99 @@ def print_command(command):
     for line in lines[:DIFF_MAX_LINES]:
         print(line)
     if len(lines) > DIFF_MAX_LINES:
-        print(dim(f"... +{len(lines) - DIFF_MAX_LINES} more lines"))
+        more = f"... +{len(lines) - DIFF_MAX_LINES} more lines"
+        spill = _spill(COMMAND_SPILL_FILE, str(command))
+        if spill:
+            more += f" {TOOL_MARK} {spill} (ctrl+click to read it all)"
+        print(dim(more))
     print(dim(rule))
+
+
+# ---------- Side-by-side review (press D during an edit approval) ----------
+
+REVIEW_DIR = os.path.join(DATA_DIR, "review")
+_code_cli_cache = ("unresolved",)
+
+
+def _code_cli():
+    """Path of the VS Code CLI, or None. Cached — PATH doesn't change
+    mid-session, and this runs inside the approval flow."""
+    global _code_cli_cache
+    if _code_cli_cache == ("unresolved",):
+        _code_cli_cache = shutil.which("code")
+    return _code_cli_cache
+
+
+def review_files(tool_name, tool_input):
+    """Full current/proposed contents for a pending Edit/Write, or None
+    when the outcome can't be reconstructed honestly (e.g. the Edit's
+    old_string isn't in the file — the CLI would reject that call anyway).
+    Pure: writes nothing, so the prompt hint can probe it safely."""
+    path = tool_input.get("file_path") or ""
+    if not path:
+        return None
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            current = f.read()
+    except OSError:
+        current = ""  # new file: the left side is empty
+    if tool_name == "Write":
+        proposed = tool_input.get("content") or ""
+    elif tool_name == "Edit":
+        old = tool_input.get("old_string") or ""
+        if not old or old not in current:
+            return None
+        new = tool_input.get("new_string") or ""
+        count = -1 if tool_input.get("replace_all") else 1
+        proposed = current.replace(old, new, count)
+    else:
+        return None
+    if current == proposed:
+        return None
+    return current, proposed, (os.path.basename(path) or "file")
+
+
+def open_review(tool_name, tool_input):
+    """Write the pending change as two real files and open them side by
+    side in VS Code. The tab is a viewer, not a channel: edits made there
+    change nothing — steering happens by voice ("no, <feedback>").
+    Returns False when anything is missing or fails."""
+    code = _code_cli()
+    files = review_files(tool_name, tool_input)
+    if not code or not files:
+        return False
+    current, proposed, name = files  # keep the extension: syntax colors
+    try:
+        os.makedirs(REVIEW_DIR, exist_ok=True)
+        cur_path = os.path.join(REVIEW_DIR, f"current-{name}")
+        new_path = os.path.join(REVIEW_DIR, f"proposed-{name}")
+        with open(cur_path, "w", encoding="utf-8") as f:
+            f.write(current)
+        with open(new_path, "w", encoding="utf-8") as f:
+            f.write(proposed)
+        subprocess.Popen(
+            [code, "--diff", cur_path, new_path],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=0x08000000)  # CREATE_NO_WINDOW: no cmd flash
+        return True
+    except OSError:
+        return False
+
+
+def poll_review_key(review, prompt):
+    """One approval-wait tick: consume pending console keys, open the
+    side-by-side on D. Repeats are allowed — reopening a closed tab is
+    the reason someone presses it twice."""
+    for ch in terminal_focus.take_keys():
+        if ch in ("d", "D"):
+            clear_status()
+            if open_review(*review):
+                note = "(side-by-side open in VS Code — click back here to answer)"
+            else:
+                note = "(couldn't open VS Code — is 'code' on PATH?)"
+            print(f"  {dim(note)}")
+            status(dim(f"» {prompt}"))
+            return
 
 
 READONLY_DENY = (
@@ -2021,8 +2142,16 @@ async def voice_permission_callback(tool_name, tool_input, context):
             # away — nobody should sit through speech they've already read.
             await asyncio.to_thread(speaker.wait_or_interrupt)
 
+            # A reviewable edit offers D: the pending change opens side by
+            # side in VS Code. Hint only when it would actually work.
+            review = None
+            if diff and _code_cli() and review_files(tool_name, tool_input):
+                review = (tool_name, tool_input)
+            answer_prompt = f"hold {PTT_LABEL} to answer (yes / no)"
+            if review:
+                answer_prompt += f" {TOOL_MARK} d: side-by-side"
             audio = await asyncio.to_thread(
-                recorder.record_while_held, f"hold {PTT_LABEL} to answer (yes / no)"
+                recorder.record_while_held, answer_prompt, review
             )
             if audio is None:
                 clear_status()
