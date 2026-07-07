@@ -174,12 +174,38 @@ class TerminalFocus:
         self._esc = ""      # partially received escape sequence
         self._lock = threading.Lock()
         self._enabled = False
+        self._conin = None      # CONIN$ handle while VT input mode is ours
+        self._prev_mode = None  # console input mode to restore on exit
 
     def enable(self):
         # Only where ANSI goes through at all — and never before the last
         # input(): an alt-tab would type ESC[O into the resume answer.
         if msvcrt is None or not _USE_COLOR:
             return
+        # Asking the terminal to send focus reports (1004h below) is only
+        # half the job: under ConPTY (Windows Terminal, VS Code) conhost
+        # SWALLOWS the incoming ESC[I/O — they arrive neither as characters
+        # nor as FOCUS_EVENT records (verified with a pseudoconsole probe on
+        # this machine, 2026-07-07). ENABLE_VIRTUAL_TERMINAL_INPUT makes
+        # conhost pass them through as characters for pump() to parse.
+        # Plain keys ('t') still arrive as themselves, and Ctrl+C keeps
+        # signaling because ENABLE_PROCESSED_INPUT stays set.
+        try:
+            import ctypes
+            from ctypes import wintypes
+            k32 = ctypes.windll.kernel32
+            conin = k32.CreateFileW("CONIN$", 0xC0000000, 3, None, 3, 0, None)
+            if conin not in (None, -1):
+                mode = wintypes.DWORD()
+                if k32.GetConsoleMode(conin, ctypes.byref(mode)):
+                    ENABLE_VIRTUAL_TERMINAL_INPUT = 0x0200
+                    if k32.SetConsoleMode(
+                            conin,
+                            mode.value | ENABLE_VIRTUAL_TERMINAL_INPUT):
+                        self._conin = conin
+                        self._prev_mode = mode.value
+        except Exception:
+            pass  # fail open: focus reports just won't arrive
         sys.stdout.write("\x1b[?1004h")
         sys.stdout.flush()
         self._enabled = True
@@ -197,6 +223,15 @@ class TerminalFocus:
             sys.stdout.flush()
         except (OSError, ValueError):
             pass
+        if self._conin is not None:
+            try:
+                import ctypes
+                ctypes.windll.kernel32.SetConsoleMode(
+                    self._conin, self._prev_mode)
+                ctypes.windll.kernel32.CloseHandle(self._conin)
+            except Exception:
+                pass
+            self._conin = None
 
     def _feed(self, ch):
         """One character of console input. Focus reports update state;
