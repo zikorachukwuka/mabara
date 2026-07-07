@@ -14,6 +14,11 @@ import sys
 import json
 import os
 import argparse
+import textwrap
+try:
+    import msvcrt  # console key polling for the transcript fold-out
+except ImportError:
+    msvcrt = None
 # All models are cached locally, so skip HuggingFace Hub's startup network
 # checks. If you ever switch to a Whisper model you haven't downloaded yet,
 # run once with HF_HUB_OFFLINE=0 in the environment to allow the download.
@@ -101,12 +106,12 @@ def ptt_pressed():
 
 # The keyboard hook above is system-wide: every Mabara process sees every
 # press of the push-to-talk key, so two sessions in two windows both woke
-# and answered together. The key counts only when this session's terminal
-# is the foreground window: either our own console window has focus
-# (legacy conhost), or the focused window belongs to an ancestor process
-# (Windows Terminal, VS Code — the shell running Mabara is their child).
-# Known limit: two tabs inside ONE terminal window share a foreground
-# process and can't be told apart — run sessions in separate windows.
+# and answered together. Ownership is decided in layers: a lone session
+# takes every press (nothing to arbitrate); otherwise the terminal's own
+# focus report decides (mode 1004 — the only signal that can tell two
+# VS Code panes apart); terminals that don't send one fall back to the
+# window checks (own console focused, or the focused window belongs to an
+# ancestor process), which is exactly classic conhost where those work.
 _focus_ancestors = None  # ancestor PIDs, computed once on first key press
 
 
@@ -147,12 +152,143 @@ def _ancestor_pids():
     return pids
 
 
+class TerminalFocus:
+    """Pane-level focus, reported by the terminal itself (xterm mode 1004).
+
+    The window checks in session_has_focus can't see INSIDE a terminal
+    host: every VS Code terminal — tab, split, even a second VS Code
+    window — belongs to the same Code.exe, so two sessions both looked
+    focused and answered in chorus (observed live 2026-07-07). With focus
+    reporting enabled, VS Code and Windows Terminal write ESC[I / ESC[O
+    to stdin when the pane gains/loses focus. Classic conhost never sends
+    one, which leaves `state` at None and the window checks in charge —
+    the one host where they actually work.
+
+    This class owns ALL console-input reading: focus sequences update
+    `state`, every other key is queued for the fold-out's poll. One
+    reader, because two consumers of msvcrt steal each other's bytes."""
+
+    def __init__(self):
+        self.state = None   # None until the terminal proves it speaks 1004
+        self._keys = []
+        self._esc = ""      # partially received escape sequence
+        self._lock = threading.Lock()
+        self._enabled = False
+
+    def enable(self):
+        # Only where ANSI goes through at all — and never before the last
+        # input(): an alt-tab would type ESC[O into the resume answer.
+        if msvcrt is None or not _USE_COLOR:
+            return
+        sys.stdout.write("\x1b[?1004h")
+        sys.stdout.flush()
+        self._enabled = True
+        atexit.register(self.disable)
+
+    def disable(self):
+        # Left on after exit, 1004 sprays ESC[I/O into the shell on every
+        # alt-tab. Idempotent: the Ctrl+C path os._exit()s past atexit and
+        # calls this directly.
+        if not self._enabled:
+            return
+        self._enabled = False
+        try:
+            sys.stdout.write("\x1b[?1004l")
+            sys.stdout.flush()
+        except (OSError, ValueError):
+            pass
+
+    def _feed(self, ch):
+        """One character of console input. Focus reports update state;
+        anything else — including an abandoned escape prefix — passes
+        through to the key queue untouched."""
+        if self._esc:
+            candidate = self._esc + ch
+            if candidate in ("\x1b[I", "\x1b[O"):
+                self.state = candidate == "\x1b[I"
+                self._esc = ""
+            elif "\x1b[I".startswith(candidate) or "\x1b[O".startswith(candidate):
+                self._esc = candidate
+            else:
+                self._keys.extend(candidate[:-1])
+                self._esc = ""
+                self._feed(ch)  # re-examine: could start a new sequence
+            return
+        if ch == "\x1b":
+            self._esc = ch
+        else:
+            self._keys.append(ch)
+
+    def pump(self):
+        """Parse everything currently buffered in the console."""
+        if msvcrt is None:
+            return
+        with self._lock:
+            try:
+                while msvcrt.kbhit():
+                    self._feed(msvcrt.getwch())
+            except OSError:
+                pass
+
+    def take_keys(self):
+        """Pending non-focus keys, for whoever reads the keyboard."""
+        self.pump()
+        with self._lock:
+            keys, self._keys = self._keys, []
+        return keys
+
+    def discard_keys(self):
+        """Drop buffered keystrokes but keep what they said about focus —
+        stray typing must not toggle anything later."""
+        self.take_keys()
+
+
+terminal_focus = TerminalFocus()
+
+# Solo-session cache: gating only matters when a second session could
+# answer too. (value, checked_at) — recounted at most every few seconds,
+# because this runs on every key press.
+_solo_cache = (True, 0.0)
+
+
+def _solo_session():
+    """True when no OTHER live Mabara holds a repo lock. A lone session
+    keeps the ungated behavior — the key works no matter which window has
+    focus, so glancing at an editor or browser never deadens push-to-talk."""
+    global _solo_cache
+    value, checked = _solo_cache
+    if time.time() - checked < 3.0:
+        return value
+    count = 0
+    try:
+        for name in os.listdir(LOCKS_DIR):
+            try:
+                with open(os.path.join(LOCKS_DIR, name), encoding="utf-8") as f:
+                    pid = int(f.read().strip() or 0)
+            except (OSError, ValueError):
+                continue
+            if pid == os.getpid() or _pid_running(pid):
+                count += 1
+    except OSError:
+        pass
+    value = count <= 1
+    _solo_cache = (value, time.time())
+    return value
+
+
 def session_has_focus():
-    """True when this session's terminal owns the foreground window.
-    Fails open — if any Windows call breaks, behavior is exactly the old
-    single-session behavior rather than a dead push-to-talk key."""
+    """Does this press of the push-to-talk key belong to this session?
+    Solo sessions always say yes; otherwise the terminal's own focus
+    report decides, then the window checks. Fails open — if any layer
+    breaks, behavior is the old single-session behavior rather than a
+    dead push-to-talk key."""
     global _focus_ancestors
     try:
+        if _solo_session():
+            return True
+        terminal_focus.pump()
+        if terminal_focus.state is not None:
+            return terminal_focus.state
         import ctypes
         from ctypes import wintypes
         user32 = ctypes.windll.user32
@@ -462,20 +598,159 @@ def prompt_resume(session_id):
 # file and one .1 backup instead of growing without limit.
 TRANSCRIPT_MAX_BYTES = 5 * 1024 * 1024
 
+# Running line count of TRANSCRIPT_FILE, so each entry can be referenced as
+# a clickable file:line in the terminal. Counted once lazily, then kept in
+# step by counting the newlines actually written; rotation resets it.
+_transcript_lines = None
+
+
+def _count_file_lines(path):
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return sum(1 for _ in f)
+    except OSError:
+        return 0
+
 
 def append_transcript(role, text):
     """The terminal only shows subtitles while Mabara speaks; the full prose
-    lands here so it can always be re-read."""
+    lands here so it can always be re-read. Returns the 1-based line number
+    where the entry starts, or None if the write failed."""
+    global _transcript_lines
     if not text:
-        return
+        return None
     try:
         if (os.path.exists(TRANSCRIPT_FILE)
                 and os.path.getsize(TRANSCRIPT_FILE) >= TRANSCRIPT_MAX_BYTES):
             os.replace(TRANSCRIPT_FILE, TRANSCRIPT_FILE + ".1")
+            _transcript_lines = 0
+        if _transcript_lines is None:
+            _transcript_lines = _count_file_lines(TRANSCRIPT_FILE)
+        entry = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {role}: {text}\n"
         with open(TRANSCRIPT_FILE, "a", encoding="utf-8") as f:
-            f.write(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {role}: {text}\n")
+            f.write(entry)
+        first_line = _transcript_lines + 1
+        # Code blocks carry their own newlines, so an entry can span lines
+        _transcript_lines += entry.count("\n")
+        return first_line
     except OSError:
-        pass
+        return None
+
+
+# ---------- Last-reply fold-out (press T while idle) ----------
+
+class LastTurnView:
+    """Reread the reply you just heard: pressing T between turns prints the
+    sentences under the summary line; pressing T again folds them away.
+
+    The fold works by erasing upward with ANSI — possible only while the
+    block is still the newest thing on screen, which the idle loop
+    guarantees (nothing else prints while waiting for push-to-talk). The
+    moment a new turn starts the block is surrendered to scrollback and
+    the toggle state resets. Older turns live in transcripts.log; the
+    footer prints that path with the entry's line number, which VS Code
+    and Windows Terminal render as a clickable link."""
+
+    def __init__(self):
+        self._lines = []       # last turn's sentences / code placeholders
+        self._log_line = None  # entry's 1-based line in transcripts.log
+        self._rows = 0         # terminal rows printed while unfolded
+        self._unfolded = False
+
+    def set_turn(self, lines, log_line):
+        self._lines = [line for line in lines if line.strip()]
+        self._log_line = log_line
+        self._rows = 0
+        self._unfolded = False
+
+    def drain(self):
+        """Discard console keys buffered before the idle wait began, so a
+        stray keystroke made while Mabara was talking doesn't count as a
+        toggle (and never leaks into a later input()). Goes through the
+        focus tracker — the only console reader — so any focus reports
+        hiding in the backlog still update the state they describe."""
+        terminal_focus.discard_keys()
+
+    def poll(self, prompt):
+        """One idle-loop tick: consume pending console keys, toggle on T.
+        Console input only carries keys typed into THIS pane, so unlike
+        the global push-to-talk hook it needs no focus arbitration."""
+        pressed = False
+        skip_next = False
+        for ch in terminal_focus.take_keys():
+            if skip_next:  # second half of an arrow/F-key event pair
+                skip_next = False
+                continue
+            if ch in ("\x00", "\xe0"):
+                skip_next = True
+                continue
+            if ch in ("t", "T"):
+                pressed = True
+        if pressed and self._lines:
+            if self._unfolded:
+                self._fold()
+            else:
+                self._unfold()
+            status(dim(f"» {prompt}"))
+
+    def leave_idle(self):
+        """Idle is ending: new output will print below the block, so it can
+        no longer be erased. Leave it on screen and forget it."""
+        self._rows = 0
+        self._unfolded = False
+
+    def _unfold(self):
+        size = shutil.get_terminal_size((80, 24))
+        wrap_width = max(20, min(size.columns - 6, 92))
+        body = []
+        for line in self._lines:
+            body.extend(textwrap.wrap(line, wrap_width) or [line])
+        # Cap to the viewport: rows that scroll off the top can't be erased
+        # on fold and would be left behind as artifacts.
+        max_body = max(4, size.lines - 5)
+        clipped = len(body) > max_body
+        if clipped:
+            body = body[-max_body:]
+
+        def row(text):
+            # One row per print — folding counts prints to know what to
+            # erase, so no printed line may wrap. (Resizing the terminal
+            # between unfold and fold can still break the count; rare.)
+            limit = max(10, size.columns - 3)
+            if len(text) > limit:
+                text = text[:limit - 1] + "…"
+            print(f"  {dim(text)}")
+
+        clear_status()
+        rule = "-" * min(46, max(12, size.columns - 4))
+        header = ("--[ last reply (end — full text in the log) ]" if clipped
+                  else "--[ last reply ]")
+        row(header + rule[len(header):])
+        for text in body:
+            row("  " + text)
+        row(rule)
+        ref = TRANSCRIPT_FILE + (f":{self._log_line}" if self._log_line else "")
+        # Clip the ref from the LEFT: the filename and line number are the
+        # part worth keeping (and clicking) when the terminal is narrow.
+        limit = max(10, size.columns - 5)
+        if len(ref) > limit:
+            ref = "…" + ref[-(limit - 1):]
+        row(ref)
+        self._rows = len(body) + 3
+        self._unfolded = True
+
+    def _fold(self):
+        clear_status()
+        if _USE_COLOR:
+            # Erase upward through everything _unfold printed; the cursor
+            # lands where the header was, ready for the status line.
+            sys.stdout.write("\033[A\033[2K" * self._rows)
+            sys.stdout.flush()
+        self._rows = 0
+        self._unfolded = False
+
+
+last_turn_view = LastTurnView()
 
 
 # ---------- Git safety net (checkpoints + voice revert) ----------
@@ -839,6 +1114,17 @@ def is_affirmative(answer):
     return all(w in _YES_WORDS or w in _FILLER_WORDS for w in words)
 
 
+def is_plain_denial(answer):
+    """A bare 'no' — every word inside the approval vocabulary — versus a
+    denial that carries content ('no, use port 5433'). Content is worth
+    forwarding to the model as feedback instead of discarding; a bare no
+    just means stop. Empty or unintelligible-silence answers count as
+    plain: there is nothing to forward."""
+    words = re.findall(r"[a-z']+", answer.lower())
+    return all(w in _NO_WORDS or w in _YES_WORDS or w in _FILLER_WORDS
+               for w in words)
+
+
 _TASK_GRANT_WORDS = {"task", "everything", "all"}
 
 
@@ -882,11 +1168,20 @@ class Recorder:
                     self._preroll.pop(0)
 
     def record_while_held(self, prompt=None):
+        # The bare between-turns idle doubles as the window for the last-
+        # reply fold-out; approval prompts (prompt=...) don't offer it.
+        main_idle = prompt is None
         if prompt is None:
             prompt = f"hold {PTT_LABEL} to talk"
         status(dim(f"» {prompt}"))
+        if main_idle:
+            last_turn_view.drain()
         while not ptt_pressed():
+            if main_idle:
+                last_turn_view.poll(prompt)
             time.sleep(0.01)
+        if main_idle:
+            last_turn_view.leave_idle()
 
         status(f"{red(DOT)} listening — release when done")
         with self._lock:
@@ -1731,7 +2026,7 @@ async def voice_permission_callback(tool_name, tool_input, context):
                     print(f"  {dim(CHECKPOINT_HINT)}")
                 print()
                 return PermissionResultAllow()
-            else:
+            elif is_plain_denial(answer):
                 print(f"  {dim('denied')}\n")
                 append_transcript("Mabara", "Okay, I won't do that.")
                 speaker.say("Okay, I won't do that.")
@@ -1739,6 +2034,20 @@ async def voice_permission_callback(tool_name, tool_input, context):
                     "User declined via voice. Do not retry this tool call — "
                     "if you can't proceed without it, ask the user what "
                     "they'd like instead."))
+            else:
+                # The answer carried more than a no — a correction, a
+                # condition, a redirection. Forward the words instead of
+                # discarding them: "no, use port 5433" should steer the
+                # next attempt, not dead-end the task.
+                spoken = answer.strip()
+                print(f"  {dim('denied — feedback passed to Mabara')}\n")
+                append_transcript("Mabara", "Okay — one sec, let me address that.")
+                speaker.say("Okay — one sec, let me address that.")
+                return PermissionResultDeny(message=(
+                    f'User declined this call and said: "{spoken}". Treat '
+                    "that as feedback: revise the plan or the change "
+                    "accordingly, and request approval again once it's "
+                    "addressed. Don't repeat the identical request."))
     finally:
         _approvals_pending -= 1
         _pending_asks[tool_name] -= 1
@@ -1849,6 +2158,12 @@ class SentenceStreamer:
 
     def transcript_text(self):
         return " ".join(self._transcript)
+
+    def spoken_lines(self):
+        """The turn's sentences for the on-screen fold-out. Code blocks
+        were already printed in full above, so they fold to a marker."""
+        return ["(code block — shown above)" if s.startswith("[CODE]") else s
+                for s in self._transcript]
 
 
 def describe_result_error(result_text):
@@ -2312,6 +2627,10 @@ async def main():
             resume_id = existing_session
         print()
 
+    # The resume prompt above was the last input(); from here on the
+    # terminal may report pane focus without typing into anything.
+    terminal_focus.enable()
+
     print(f"  {dim('tip: ' + random.choice(TIPS))}")
     print()
 
@@ -2394,9 +2713,12 @@ async def main():
             "to approve them all at once. The same goes for repeated calls "
             "of one tool, like several web searches: approvals are asked "
             "one at a time, so say up front how many you plan and that "
-            "'yes to all' approves the rest in one go. If an approval "
-            "comes back denied because the user declined, never retry the "
-            "same call — ask them what they'd like instead. Always do the work yourself with "
+            "'yes to all' approves the rest in one go. When an approval "
+            "comes back denied: if the denial quotes the user's words, "
+            "that's feedback — say in one sentence how you're addressing "
+            "it, revise, and request approval again; a bare denial means "
+            "drop that call and ask what they'd like instead, never "
+            "retrying the identical request. Always do the work yourself with "
             "your own tools, in this turn — never launch agents or "
             "background tasks: the user is on a live voice call with you "
             "and anything that finishes 'later' finishes never.\n\n"
@@ -2569,7 +2891,8 @@ async def main():
                     speaker.wait_until_done()
                     continue
 
-                append_transcript("Mabara", streamer.transcript_text())
+                log_line = append_transcript("Mabara", streamer.transcript_text())
+                last_turn_view.set_turn(streamer.spoken_lines(), log_line)
                 if session_id and session_id != saved_session_id:
                     save_session(repo_path, session_id)
                     saved_session_id = session_id
@@ -2584,6 +2907,8 @@ async def main():
                                + ("s" if streamer.sentence_count != 1 else "")
                     if tool_calls:
                         summary += f" · {tool_calls} tool call" + ("s" if tool_calls != 1 else "")
+                    if streamer.sentence_count:
+                        summary += " · press t to read them"
                     clear_status()
                     print(f"  {green(CHECK)} {dim(summary)}")
                     # The task's receipt: per-file line counts, diffstat-style
@@ -2607,7 +2932,8 @@ def _farewell_and_exit(signum=None, frame=None):
     There's nothing to flush: sessions and transcripts are saved per turn."""
     stop_thinking()
     clear_status()
-    release_repo_lock()  # os._exit below skips atexit
+    release_repo_lock()       # os._exit below skips atexit
+    terminal_focus.disable()  # ditto — or the shell inherits ESC[I/O spam
     farewell = "\n  Goodbye."
     if session_saved:
         farewell += dim("  (this conversation will resume next launch)")

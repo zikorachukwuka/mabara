@@ -77,6 +77,18 @@ def test_non_affirmative_answers_deny(answer):
     assert not va.is_affirmative(answer)
 
 
+def test_plain_denial_versus_feedback():
+    # Bare no: only approval-vocabulary words — nothing worth forwarding
+    assert va.is_plain_denial("no")
+    assert va.is_plain_denial("nope, cancel that")
+    assert va.is_plain_denial("no, please don't")
+    assert va.is_plain_denial("")
+    # Content rides the denial — forwarded to the model, not discarded
+    assert not va.is_plain_denial("no, use port five instead")
+    assert not va.is_plain_denial("yes but rename the table first")
+    assert not va.is_plain_denial("hold on, what does this change?")
+
+
 def test_whole_task_grant_needs_the_word_not_the_substring():
     assert va.grants_whole_task("yes for the whole task")
     assert va.grants_whole_task("yes to all")
@@ -407,6 +419,8 @@ def test_denials_do_not_double_report():
         "can't proceed without it, ask the user what they'd like instead.",
         "No answer was captured from the user — the microphone heard "
         "nothing, so this is not a refusal.",
+        'User declined this call and said: "no, use port five instead". '
+        "Treat that as feedback: revise the plan or the change accordingly.",
     ]:
         assert va.describe_tool_outcome(
             _Block("t3", is_error=True, content=message),
@@ -583,3 +597,64 @@ def test_focus_helpers_fail_open_not_crash():
     assert os.getpid() in pids
     assert len(pids) >= 2  # at least us + the shell that ran pytest
     assert va.session_has_focus() in (True, False)
+
+
+# ---------- Pane-level focus (terminal focus reports, mode 1004) ----------
+
+def test_terminal_focus_parses_focus_reports():
+    tf = va.TerminalFocus()
+    for ch in "\x1b[I":
+        tf._feed(ch)
+    assert tf.state is True and tf._keys == []
+    for ch in "\x1b[O":
+        tf._feed(ch)
+    assert tf.state is False and tf._keys == []
+
+
+def test_terminal_focus_keys_pass_through_around_reports():
+    tf = va.TerminalFocus()
+    for ch in "t\x1b[Iq":
+        tf._feed(ch)
+    assert tf.state is True
+    assert tf._keys == ["t", "q"]
+
+
+def test_terminal_focus_non_focus_escapes_are_forwarded():
+    tf = va.TerminalFocus()
+    for ch in "\x1bx":  # bare ESC then a key — both must survive
+        tf._feed(ch)
+    assert tf._keys == ["\x1b", "x"] and tf.state is None
+    tf = va.TerminalFocus()
+    for ch in "\x1b[A":  # a CSI that isn't a focus report
+        tf._feed(ch)
+    assert tf._keys == ["\x1b", "[", "A"] and tf.state is None
+
+
+def test_session_focus_layers(monkeypatch):
+    # Solo session: every press is ours, no other layer consulted
+    monkeypatch.setattr(va, "_solo_session", lambda: True)
+    monkeypatch.setattr(va.terminal_focus, "state", False)
+    assert va.session_has_focus() is True
+    # Contended: the terminal's own report wins, in both directions
+    monkeypatch.setattr(va, "_solo_session", lambda: False)
+    monkeypatch.setattr(va.terminal_focus, "pump", lambda: None)
+    assert va.session_has_focus() is False
+    monkeypatch.setattr(va.terminal_focus, "state", True)
+    assert va.session_has_focus() is True
+
+
+def test_solo_session_counts_live_locks(lock_dir, monkeypatch):
+    monkeypatch.setattr(va, "_solo_cache", (True, 0.0))
+    os.makedirs(va.LOCKS_DIR, exist_ok=True)
+    with open(os.path.join(va.LOCKS_DIR, "own.lock"), "w") as f:
+        f.write(str(os.getpid()))
+    assert va._solo_session() is True  # just us -> ungated
+    holder = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        monkeypatch.setattr(va, "_solo_cache", (True, 0.0))  # bust the cache
+        with open(os.path.join(va.LOCKS_DIR, "other.lock"), "w") as f:
+            f.write(str(holder.pid))
+        assert va._solo_session() is False  # a live second session -> gated
+    finally:
+        holder.kill()

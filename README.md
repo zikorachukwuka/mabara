@@ -92,10 +92,11 @@ function mabara {
 - **Push-to-talk** (Right Ctrl) with an always-open mic and pre-roll buffer, so your first syllable is never clipped
 - **Streaming speech** - Mabara starts talking after its first *sentence* is ready, not after the full response; sentences batch adaptively when synthesis needs headroom
 - **Barge-in** - hold the key while Mabara talks: playback stops within 0.2s, the model stops generating, and it's instantly listening to you
-- **Voice-gated tool safety** - reads are free; every edit and shell command is spoken aloud and requires your verbal "yes", asked one at a time even when Claude queues several tool calls at once; answering *"yes, for the whole task"* auto-approves the rest of that task's edits, and *"yes to all"* during a repeated ask (say, several web searches) covers the rest of that tool's calls (shell commands always ask)
+- **Reread the last reply** - press `t` between turns to fold out everything Mabara just said (for when you stepped away while it talked), press `t` again to fold it back up; the fold-out ends with a clickable `transcripts.log:line` reference, and that log keeps every word from every turn
+- **Voice-gated tool safety** - reads are free; every edit and shell command is spoken aloud and requires your verbal "yes", asked one at a time even when Claude queues several tool calls at once; answering *"yes, for the whole task"* auto-approves the rest of that task's edits, and *"yes to all"* during a repeated ask (say, several web searches) covers the rest of that tool's calls (shell commands always ask); a denial that carries words - *"no, use port 5433"* - is forwarded to Mabara as feedback, so it revises the change and asks again instead of dead-ending
 - **Git safety net** - edits only allowed inside a git repo; every edit-task gets an automatic checkpoint; **"revert that"** undoes the last task deterministically (including restoring your own untracked files rather than deleting them); **"commit this"** turns a finished task into a real commit - only the task's files, never your unrelated changes
 - **Dual-brain economics** - **"switch to haiku"** / **"switch to sonnet"** swaps the model *mid-conversation* with full context retained: quality by default, quota-stretching on demand
-- **Multi-session aware** - push-to-talk only fires in the terminal window you're looking at, so sessions on different repos can run side by side without answering in chorus; a second session on the *same* repo is refused at startup (use separate windows, not tabs - two tabs of one terminal window can't be told apart)
+- **Multi-session aware** - a lone session hears the talk key from anywhere; with two or more running, each press belongs to the terminal pane you're focused on - the terminal itself reports pane focus (VS Code splits and tabs, Windows Terminal, conhost all covered); a second session on the *same* repo is refused at startup
 - **Per-repo resumable sessions**, spoken error reporting (including usage-limit warnings with reset times), path-sanitized speech (you hear "page.tsx", never "C colon backslash..."), and a `--readonly` look-don't-touch mode
 
 ## Voice commands
@@ -104,6 +105,7 @@ function mabara {
 |---|---|
 | *(anything else)* | goes to Claude |
 | "yes" / "no" | answer an approval |
+| "no, *<feedback>*" | deny **and** steer - your words reach Mabara, which revises and asks again |
 | "yes, for the whole task" | approve all remaining edits this task |
 | "yes to all" | approve the rest of a repeated ask (e.g. queued searches) |
 | "revert that" | git-restore everything the last task touched |
