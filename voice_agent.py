@@ -1,4 +1,6 @@
 import asyncio
+import atexit
+import hashlib
 import re
 import difflib
 import time
@@ -85,16 +87,164 @@ _ptt_down = False
 def _track_ptt(event):
     global _ptt_down
     if event.name and event.name.lower() == PUSH_TO_TALK_KEY:
-        _ptt_down = event.event_type == keyboard.KEY_DOWN
+        # The hook is system-wide; focus decides ownership (see below).
+        # Key-up always clears, so losing focus mid-hold can't stick the key.
+        if event.event_type == keyboard.KEY_DOWN:
+            _ptt_down = session_has_focus()
+        else:
+            _ptt_down = False
 
 
 def ptt_pressed():
     return _ptt_down
+
+
+# The keyboard hook above is system-wide: every Mabara process sees every
+# press of the push-to-talk key, so two sessions in two windows both woke
+# and answered together. The key counts only when this session's terminal
+# is the foreground window: either our own console window has focus
+# (legacy conhost), or the focused window belongs to an ancestor process
+# (Windows Terminal, VS Code — the shell running Mabara is their child).
+# Known limit: two tabs inside ONE terminal window share a foreground
+# process and can't be told apart — run sessions in separate windows.
+_focus_ancestors = None  # ancestor PIDs, computed once on first key press
+
+
+def _ancestor_pids():
+    """Our PID plus every ancestor's, via a Toolhelp32 process snapshot."""
+    import ctypes
+    from ctypes import wintypes
+
+    class PROCESSENTRY32(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD),
+                    ("cntUsage", wintypes.DWORD),
+                    ("th32ProcessID", wintypes.DWORD),
+                    ("th32DefaultHeapID", ctypes.c_size_t),
+                    ("th32ModuleID", wintypes.DWORD),
+                    ("cntThreads", wintypes.DWORD),
+                    ("th32ParentProcessID", wintypes.DWORD),
+                    ("pcPriClassBase", ctypes.c_long),
+                    ("dwFlags", wintypes.DWORD),
+                    ("szExeFile", ctypes.c_char * 260)]
+
+    k32 = ctypes.windll.kernel32
+    snapshot = k32.CreateToolhelp32Snapshot(0x2, 0)  # TH32CS_SNAPPROCESS
+    parent_of = {}
+    entry = PROCESSENTRY32()
+    entry.dwSize = ctypes.sizeof(PROCESSENTRY32)
+    if k32.Process32First(snapshot, ctypes.byref(entry)):
+        while True:
+            parent_of[entry.th32ProcessID] = entry.th32ParentProcessID
+            if not k32.Process32Next(snapshot, ctypes.byref(entry)):
+                break
+    k32.CloseHandle(snapshot)
+
+    pids = set()
+    pid = os.getpid()
+    while pid and pid not in pids:  # PID reuse can make the map cyclic
+        pids.add(pid)
+        pid = parent_of.get(pid, 0)
+    return pids
+
+
+def session_has_focus():
+    """True when this session's terminal owns the foreground window.
+    Fails open — if any Windows call breaks, behavior is exactly the old
+    single-session behavior rather than a dead push-to-talk key."""
+    global _focus_ancestors
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.windll.user32
+        kernel32 = ctypes.windll.kernel32
+        foreground = user32.GetForegroundWindow()
+        if not foreground:
+            return True
+        console = kernel32.GetConsoleWindow()
+        if console and foreground == console:
+            return True
+        if _focus_ancestors is None:
+            _focus_ancestors = _ancestor_pids()
+        owner = wintypes.DWORD()
+        user32.GetWindowThreadProcessId(foreground, ctypes.byref(owner))
+        return owner.value in _focus_ancestors
+    except Exception:
+        return True
 _HERE = os.path.dirname(os.path.abspath(__file__))
 MODELS_DIR = os.path.join(_HERE, "models")   # downloaded TTS models/voices
 DATA_DIR = os.path.join(_HERE, "data")       # runtime state (sessions, transcripts)
 os.makedirs(DATA_DIR, exist_ok=True)
 SESSION_STORE_FILE = os.path.join(DATA_DIR, "sessions.json")
+
+# ---------- One session per repo (lockfile) ----------
+# Two Mabara sessions on the SAME repo would fight over checkpoints,
+# session state, and the transcript — that's blocked outright at startup.
+# Different repos in different windows coexist fine (session_has_focus
+# decides who owns the push-to-talk key), so the lock is per repo path.
+LOCKS_DIR = os.path.join(DATA_DIR, "locks")
+_repo_lock_path = None  # held lock, released at exit
+
+
+def _repo_lock_file(repo_path):
+    digest = hashlib.sha256(
+        os.path.normcase(repo_path).encode("utf-8")).hexdigest()[:16]
+    return os.path.join(LOCKS_DIR, digest + ".lock")
+
+
+def _pid_running(pid):
+    import ctypes
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFO
+    if not handle:
+        return False
+    try:
+        code = ctypes.c_ulong()
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            return False
+        return code.value == 259  # STILL_ACTIVE
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def acquire_repo_lock(repo_path):
+    """Claim this repo for the current process. Returns (True, 0) on
+    success, (False, other_pid) when a live session already holds it.
+    A lock left by a dead process (crash, force-close) is taken over."""
+    global _repo_lock_path
+    os.makedirs(LOCKS_DIR, exist_ok=True)
+    path = _repo_lock_file(repo_path)
+    try:
+        with open(path, encoding="utf-8") as f:
+            other = int(f.read().strip() or 0)
+    except (OSError, ValueError):
+        other = 0
+    if other and other != os.getpid() and _pid_running(other):
+        return (False, other)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(str(os.getpid()))
+    _repo_lock_path = path
+    atexit.register(release_repo_lock)
+    return (True, 0)
+
+
+def release_repo_lock():
+    """Remove the lock if this process still owns it. Safe to call twice —
+    both atexit and the Ctrl+C handler (which os._exit()s past atexit)
+    come through here."""
+    global _repo_lock_path
+    if not _repo_lock_path:
+        return
+    try:
+        with open(_repo_lock_path, encoding="utf-8") as f:
+            owner = int(f.read().strip() or 0)
+        # Remove only after the handle is closed — Windows can't delete
+        # an open file, and the swallowed PermissionError would leave the
+        # lock behind for the liveness check to clean up a session later.
+        if owner == os.getpid():
+            os.remove(_repo_lock_path)
+    except (OSError, ValueError):
+        pass
+    _repo_lock_path = None
 TRANSCRIPT_FILE = os.path.join(DATA_DIR, "transcripts.log")
 # fp32 on purpose: on CPUs without VNNI (like this one) the int8 model
 # benchmarks ~2.5x SLOWER than fp32, not faster.
@@ -2094,6 +2244,15 @@ async def main():
     repo_path = os.path.abspath(args.repo)
     repo_root = repo_path  # confines auto-approved reads (permission callback)
 
+    acquired, other_pid = acquire_repo_lock(repo_path)
+    if not acquired:
+        print(f"\n  {red('!')} another Mabara session (pid {other_pid}) is "
+              f"already running on this repo.")
+        print(f"  {dim('Two sessions on one repo fight over the mic, checkpoints, and session state.')}")
+        print(f"  {dim('Close the other window first — or if it crashed, delete:')}")
+        print(f"  {dim(_repo_lock_file(repo_path))}\n")
+        return
+
     def load_stt():
         _load_audio()  # np is used below (and throughout the engines)
         engine = ParakeetSTT() if args.stt == "parakeet" else WhisperSTT(args.stt)
@@ -2448,6 +2607,7 @@ def _farewell_and_exit(signum=None, frame=None):
     There's nothing to flush: sessions and transcripts are saved per turn."""
     stop_thinking()
     clear_status()
+    release_repo_lock()  # os._exit below skips atexit
     farewell = "\n  Goodbye."
     if session_saved:
         farewell += dim("  (this conversation will resume next launch)")

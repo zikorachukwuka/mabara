@@ -525,3 +525,61 @@ def test_feed_shows_out_of_repo_paths_in_full(repo):
     assert va.describe_tool_use("Read", {"file_path": inside}) == "read public/app.js"
     # An out-of-repo probe must never be shortened into looking local
     assert outside in va.describe_tool_use("Read", {"file_path": outside})
+
+
+# ---------- Multi-session safety (repo lock + focus gating) ----------
+
+@pytest.fixture
+def lock_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr(va, "LOCKS_DIR", str(tmp_path / "locks"))
+    monkeypatch.setattr(va, "_repo_lock_path", None)
+    return tmp_path
+
+
+def test_repo_lock_acquire_and_release(lock_dir):
+    acquired, other = va.acquire_repo_lock(str(lock_dir))
+    assert (acquired, other) == (True, 0)
+    assert os.path.exists(va._repo_lock_file(str(lock_dir)))
+    va.release_repo_lock()
+    assert not os.path.exists(va._repo_lock_file(str(lock_dir)))
+
+
+def test_repo_lock_blocks_a_live_session(lock_dir):
+    holder = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)"])
+    try:
+        os.makedirs(va.LOCKS_DIR, exist_ok=True)
+        with open(va._repo_lock_file(str(lock_dir)), "w") as f:
+            f.write(str(holder.pid))
+        assert va.acquire_repo_lock(str(lock_dir)) == (False, holder.pid)
+    finally:
+        holder.kill()
+
+
+def test_repo_lock_takes_over_a_stale_lock(lock_dir):
+    # A lock left by a crashed/closed session must not brick the repo
+    dead = subprocess.Popen([sys.executable, "-c", "pass"])
+    dead.wait()
+    os.makedirs(va.LOCKS_DIR, exist_ok=True)
+    with open(va._repo_lock_file(str(lock_dir)), "w") as f:
+        f.write(str(dead.pid))
+    acquired, other = va.acquire_repo_lock(str(lock_dir))
+    assert (acquired, other) == (True, 0)
+    va.release_repo_lock()
+
+
+def test_lock_file_is_per_repo_and_case_insensitive(lock_dir):
+    # Windows paths: same repo in different casing is the same lock
+    assert (va._repo_lock_file(r"C:\Users\x\repo")
+            == va._repo_lock_file(r"c:\users\X\REPO".replace("REPO", "repo").replace("X", "x")))
+    assert (va._repo_lock_file(r"C:\Users\x\repo")
+            != va._repo_lock_file(r"C:\Users\x\other"))
+
+
+def test_focus_helpers_fail_open_not_crash():
+    # The real foreground window during a test run is arbitrary; what's
+    # pinned is that the helpers work at all: the ancestor walk finds us
+    # and our shell, and the focus check returns a bool, never raises.
+    pids = va._ancestor_pids()
+    assert os.getpid() in pids
+    assert len(pids) >= 2  # at least us + the shell that ran pytest
+    assert va.session_has_focus() in (True, False)
