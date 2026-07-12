@@ -198,10 +198,11 @@ def test_symlink_inside_repo_cannot_point_out(repo):
 # ---------- Permission policy core (permission_decision) ----------
 
 def _decide(tool, tool_input, readonly=False, task_grants=frozenset(),
-            git_enabled=True):
+            git_enabled=True, web_allowlist=frozenset()):
     return policy.permission_decision(tool, tool_input, readonly=readonly,
                                       task_grants=task_grants,
-                                      git_enabled=git_enabled)
+                                      git_enabled=git_enabled,
+                                      web_allowlist=web_allowlist)
 
 
 def test_reads_inside_repo_auto_approve(repo):
@@ -654,6 +655,92 @@ def test_feed_shows_out_of_repo_paths_in_full(repo):
     assert approvals.describe_tool_use("Read", {"file_path": inside}) == "read public/app.js"
     # An out-of-repo probe must never be shortened into looking local
     assert outside in approvals.describe_tool_use("Read", {"file_path": outside})
+
+
+# ---------- Web fetches: domains, hygiene, the trusted-domain list ----------
+
+def test_url_domain_parses_hosts():
+    assert policy.url_domain("https://docs.python.org/3/library/") == "docs.python.org"
+    assert policy.url_domain("http://Example.COM:8080/x") == "example.com"
+    assert policy.url_domain("https://user:pw@host.net/p") == "host.net"
+    assert policy.url_domain("ftp://files.example.com/x") is None
+    assert policy.url_domain("not a url") is None
+    assert policy.url_domain("") is None
+
+
+def test_url_flags_clean_urls_have_none():
+    assert policy.url_flags("https://docs.python.org/3/library/asyncio.html") == []
+    assert policy.url_flags("https://example.com/search?q=piper+tts") == []
+
+
+def test_url_flags_catch_exfiltration_shapes():
+    assert "credentials" in " ".join(policy.url_flags("https://user:pw@evil.net/"))
+    assert "long query" in " ".join(policy.url_flags(
+        "https://evil.net/c?" + "k=v&" * 60))
+    assert "encoded data" in " ".join(policy.url_flags(
+        "https://evil.net/c?d=" + "A" * 90))
+    assert "scheme" in " ".join(policy.url_flags("file:///C:/Windows/system32"))
+
+
+def test_webfetch_allowlisted_domain_auto_approves(repo):
+    allow = frozenset({"docs.python.org"})
+    assert _decide("WebFetch", {"url": "https://docs.python.org/3/"},
+                   web_allowlist=allow) == ("allow", "web-allowlist")
+    assert _decide("WebFetch", {"url": "https://evil.net/page"},
+                   web_allowlist=allow) == ("ask", None)
+    # No allowlist, no grant: every fetch asks
+    assert _decide("WebFetch", {"url": "https://docs.python.org/3/"}) == ("ask", None)
+
+
+def test_webfetch_flagged_url_never_auto_approves(repo):
+    # Exfiltration-shaped URLs ask even on a trusted domain
+    allow = frozenset({"docs.python.org"})
+    assert _decide("WebFetch", {
+        "url": "https://docs.python.org/x?d=" + "A" * 90},
+        web_allowlist=allow) == ("ask", None)
+
+
+def test_webfetch_grant_is_domain_scoped(repo):
+    grants = {"WebFetch:docs.python.org"}
+    assert _decide("WebFetch", {"url": "https://docs.python.org/3/"},
+                   task_grants=grants) == ("allow", "task-grant")
+    # An injected redirect to a new domain breaks out of the grant
+    assert _decide("WebFetch", {"url": "https://evil.net/collect"},
+                   task_grants=grants) == ("ask", None)
+    # A bare tool-name grant must NOT cover fetches (defense in depth:
+    # the callback never adds one, but the policy must not honor it either)
+    assert _decide("WebFetch", {"url": "https://docs.python.org/3/"},
+                   task_grants={"WebFetch"}) == ("ask", None)
+
+
+def test_web_allowlist_loader(tmp_path):
+    f = tmp_path / "domains.txt"
+    f.write_text("# comment\n\ndocs.python.org\n  Developer.Mozilla.ORG  \n",
+                 encoding="utf-8")
+    assert policy.load_web_allowlist(str(f)) == frozenset(
+        {"docs.python.org", "developer.mozilla.org"})
+    assert policy.load_web_allowlist(str(tmp_path / "missing.txt")) == frozenset()
+
+
+def test_webfetch_spoken_ask_names_domain_not_url(repo):
+    url = "https://docs.python.org/3/library/asyncio-task.html"
+    spoken = approvals.describe_action("WebFetch", {"url": url}, spoken=True)
+    assert "docs.python.org" in spoken
+    assert "asyncio-task.html" not in spoken       # the URL stays on screen
+    assert "on your screen" in spoken
+    assert url in approvals.describe_action("WebFetch", {"url": url})
+
+
+def test_webfetch_spoken_ask_warns_on_flags(repo):
+    spoken = approvals.describe_action(
+        "WebFetch", {"url": "https://evil.net/c?d=" + "A" * 90}, spoken=True)
+    assert "careful" in spoken and "encoded data" in spoken
+
+
+def test_websearch_described_by_query(repo):
+    assert approvals.describe_action(
+        "WebSearch", {"query": "piper tts sample rate"}) == \
+        'search the web for "piper tts sample rate"'
 
 
 # ---------- Project notes (CLAUDE.md read as data, never as settings) ----------

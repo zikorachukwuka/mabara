@@ -47,6 +47,10 @@ _first_token_secs = None
 # Whether this conversation was saved for resume; read by the Ctrl+C handler
 session_saved = False
 
+# The user's trusted fetch domains (data/allowed-domains.txt), loaded once
+# at startup — fetches anywhere else need a spoken yes, per domain.
+web_allowlist = frozenset()
+
 # Count of voice approvals in flight or queued, so the barge-in watcher
 # doesn't mistake an answer for "cut Claude off". Parallel tool calls make
 # the permission callback re-enter concurrently; a plain boolean here let

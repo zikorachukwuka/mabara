@@ -3,8 +3,9 @@ audio so tests can pin every branch. See tests/test_voice_agent.py."""
 
 import os
 import re
+from urllib.parse import urlsplit
 
-from . import state
+from . import config, state
 
 READ_ONLY_TOOLS = {"Read", "Glob", "Grep"}
 # NOTE: the CLI runs its own read-only analysis first and auto-approves
@@ -108,6 +109,80 @@ def is_read_only_bash(command):
     return True
 
 
+# ---------- Web fetches (domains, hygiene, the trusted-domain list) ----------
+
+def url_domain(url):
+    """The host of an http(s) URL, lowercased, port and credentials
+    stripped — the honest speakable unit of a URL, the way a filename is
+    for a path. None for anything that isn't a plain web address."""
+    try:
+        parts = urlsplit(str(url).strip())
+    except ValueError:
+        return None
+    if parts.scheme not in ("http", "https"):
+        return None
+    try:
+        return parts.hostname or None
+    except ValueError:
+        return None
+
+
+# An encoded blob riding a URL is the exfiltration shape: injected
+# instructions can't run commands here (the voice gate holds), but they can
+# try to smuggle what the model has read out through a fetch's address.
+_ENCODED_BLOB = re.compile(r"[A-Za-z0-9+/=_\-%]{80,}")
+URL_QUERY_MAX_CHARS = 150
+
+
+def url_flags(url):
+    """Human-sentence warnings for exfiltration-shaped URLs. A flagged URL
+    never auto-approves — not even on a trusted domain — and the spoken
+    ask says why. Flags warn; they never silently deny."""
+    url = str(url).strip()
+    try:
+        parts = urlsplit(url)
+    except ValueError:
+        return ["an address that couldn't be parsed"]
+    flags = []
+    if parts.scheme and parts.scheme not in ("http", "https"):
+        flags.append("a non-web address scheme")
+    if "@" in parts.netloc:
+        flags.append("credentials embedded in the address")
+    tail = (parts.query or "") + (parts.fragment or "")
+    if len(tail) > URL_QUERY_MAX_CHARS:
+        flags.append("an unusually long query string")
+    elif _ENCODED_BLOB.search(parts.path + tail):
+        flags.append("what looks like an encoded data payload")
+    return flags
+
+
+# One domain per line, # comments — a statement of trust the user edits by
+# hand, never the model (it lives outside every repo and outside the tools).
+WEB_ALLOWLIST_FILE = os.path.join(config.DATA_DIR, "allowed-domains.txt")
+
+WEB_ALLOWLIST_TEMPLATE = """\
+# Domains Mabara may fetch from WITHOUT asking, one per line.
+# Only list documentation sites whose authors you trust: fetched pages
+# can carry hidden instructions, so a line here is a statement of trust,
+# not a convenience. Everything else asks for a spoken yes per domain.
+# Lines starting with # are ignored. Examples to uncomment:
+# docs.python.org
+# developer.mozilla.org
+"""
+
+
+def load_web_allowlist(path=None):
+    """The user's trusted fetch domains, or an empty set when the file is
+    missing or unreadable — absence fails closed to 'always ask'."""
+    try:
+        with open(path or WEB_ALLOWLIST_FILE, encoding="utf-8") as f:
+            return frozenset(
+                line.strip().lower() for line in f
+                if line.strip() and not line.strip().startswith("#"))
+    except OSError:
+        return frozenset()
+
+
 READONLY_DENY = (
     "This session is read-only: edits and commands are disabled. "
     "Explain or show code instead of changing anything."
@@ -120,14 +195,16 @@ NO_GIT_DENY = (
 
 
 def permission_decision(tool_name, tool_input, *, readonly, task_grants,
-                        git_enabled):
+                        git_enabled, web_allowlist=frozenset()):
     """The policy core of voice_permission_callback, kept free of I/O and
     mutable session state so tests can pin every branch of the most
     security-critical decision in the project. task_grants is the set of
-    whole-task grants in force ("edits" or a tool name — see
-    state._task_grants). Repo confinement still reads state.repo_root
-    through the helpers. Returns one of:
-      ("allow", why)    — auto-approve; why in {"read", "bash", "task-grant"}
+    whole-task grants in force ("edits", a tool name, or "WebFetch:<domain>"
+    — see state._task_grants); web_allowlist is the user's trusted fetch
+    domains. Repo confinement still reads state.repo_root through the
+    helpers. Returns one of:
+      ("allow", why)    — auto-approve; why in {"read", "bash",
+                          "task-grant", "web-allowlist"}
       ("deny", message) — hard block; message goes back to the CLI
       ("ask", None)     — fall through to the spoken approval flow
     """
@@ -165,6 +242,22 @@ def permission_decision(tool_name, tool_input, *, readonly, task_grants,
     if (tool_name in ("Edit", "Write") and "edits" in task_grants
             and _within_repo(tool_input.get("file_path"))):
         return ("allow", "task-grant")
+
+    # Fetches are gated by DOMAIN, not by tool: a "yes to all" given on
+    # docs.python.org must not cover an injected redirect to evil.com —
+    # the moment a fetched page steers toward a new domain, the grant
+    # breaks and a fresh spoken ask names the stranger. A hygiene-flagged
+    # URL (exfiltration-shaped) never auto-approves, not even on a trusted
+    # domain — it falls to a voice ask that says what's wrong out loud.
+    if tool_name == "WebFetch":
+        url = str(tool_input.get("url", ""))
+        domain = url_domain(url)
+        if domain and not url_flags(url):
+            if domain in web_allowlist:
+                return ("allow", "web-allowlist")
+            if f"WebFetch:{domain}" in task_grants:
+                return ("allow", "task-grant")
+        return ("ask", None)
 
     # A grant given on any other tool covers only that tool, by name — a
     # yes-to-all on web searches must not leak into anything mutating.

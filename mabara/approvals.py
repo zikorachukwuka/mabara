@@ -54,6 +54,12 @@ def describe_tool_use(name, tool_input):
     if name == "Task":
         detail = str(tool_input.get("description", "") or tool_input.get("prompt", ""))
         return f"agent: {detail[:56]}"
+    if name == "WebFetch":
+        url = str(tool_input.get("url", "?"))
+        return f"fetch {policy.url_domain(url) or url[:56]}"
+    if name == "WebSearch":
+        query = str(tool_input.get("query", "?"))
+        return f'search "{query if len(query) <= 54 else query[:53] + "…"}"'
     return name.lower()
 
 
@@ -148,6 +154,29 @@ def describe_action(tool_name, tool_input, spoken=False):
         target = (tool_input.get("file_path") or tool_input.get("path")
                   or tool_input.get("pattern") or "an unknown path")
         return f"read {target}, which is outside this repo"
+    if tool_name == "WebFetch":
+        # The domain is the honest speakable unit of a URL — but the full
+        # address always prints, and an exfiltration-shaped one (long
+        # query, encoded blob, embedded credentials) is called out in
+        # words: those are how an injected page tries to smuggle data out.
+        url = str(tool_input.get("url", "") or "")
+        domain = policy.url_domain(url)
+        flags = policy.url_flags(url)
+        if spoken:
+            action = (f"fetch a page from {domain}" if domain
+                      else "fetch a web address I couldn't parse")
+            if flags:
+                action += " — careful, the address carries " + " and ".join(flags)
+            return action + ". The full address is on your screen"
+        action = f"fetch the URL: {url or 'unknown address'}"
+        if flags:
+            action += "  [" + "; ".join(flags) + "]"
+        return action
+    if tool_name == "WebSearch":
+        query = str(tool_input.get("query", "") or "an empty query")
+        if spoken and len(query) > 90:
+            query = query[:89] + "…"
+        return f'search the web for "{query}"'
     return f"use the tool {tool_name}"
 
 
@@ -369,7 +398,8 @@ async def voice_permission_callback(tool_name, tool_input, context):
         return policy.permission_decision(
             tool_name, tool_input, readonly=state.readonly_mode,
             task_grants=state._task_grants,
-            git_enabled=state.git_safety.enabled)
+            git_enabled=state.git_safety.enabled,
+            web_allowlist=state.web_allowlist)
 
     def allow_by_grant():
         # The diff still prints when nobody is asked: an unseen edit
@@ -491,15 +521,25 @@ async def voice_permission_callback(tool_name, tool_input, context):
                 created = (state.git_safety.before_mutation(tool_name, tool_input)
                            if tool_name in ("Bash", "Edit", "Write") else False)
                 # "yes for the whole task" / "yes to all" widens the grant:
-                # on an edit, to every remaining edit this task; on any
-                # other tool, to that tool's remaining calls this task.
+                # on an edit, to every remaining edit this task; on a fetch,
+                # to THIS DOMAIN's remaining fetches only (an injected
+                # redirect to a new domain breaks out of the grant and asks
+                # afresh, naming the stranger); on any other tool, to that
+                # tool's remaining calls this task.
+                scope = None
                 if grants_whole_task(answer):
                     if tool_name in ("Edit", "Write"):
                         state._task_grants.add("edits")
                         scope = "edits"
+                    elif tool_name == "WebFetch":
+                        domain = policy.url_domain(str(tool_input.get("url", "")))
+                        if domain:  # no domain, nothing scopeable to grant
+                            state._task_grants.add(f"WebFetch:{domain}")
+                            scope = f"fetches from {domain}"
                     else:
                         state._task_grants.add(tool_name)
                         scope = f"{tool_name} calls"
+                if scope:
                     print(f"  {green('approved')} {dim(f'— and auto-approving {scope} for the rest of this task')}")
                     confirmation = "Okay — I'll handle the rest of those without asking."
                 else:
