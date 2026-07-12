@@ -194,10 +194,16 @@ NO_GIT_DENY = (
     "running git init in this folder enables editing."
 )
 OTHER_AGENT_DENY = (
-    "That agent type is disabled: the scout is the only subagent here. "
-    "Launch scouts for broad read-only exploration, or do the work "
-    "yourself with your own tools in this turn."
+    "That agent type is disabled: only the scout (read-only exploration) "
+    "and the worker (executes an approved plan) exist here. Use one of "
+    "those, or do the work yourself with your own tools in this turn."
 )
+
+# The agent types Mabara defines (mabara/agents.py) — the only launches
+# the policy lets through. The worker's launch is free like the scout's:
+# the launch itself changes nothing, and every mutating call the worker
+# makes still lands on this policy under whatever grants are in force.
+ALLOWED_AGENT_TYPES = ("scout", "worker")
 
 
 def permission_decision(tool_name, tool_input, *, readonly, task_grants,
@@ -238,8 +244,9 @@ def permission_decision(tool_name, tool_input, *, readonly, task_grants,
     # this callback for Task (2026-07-05), so treat this branch as defense
     # in depth, not the lock on the door.
     if tool_name == "Task":
-        if str(tool_input.get("subagent_type", "")).strip().lower() == "scout":
-            return ("allow", "scout")
+        agent_type = str(tool_input.get("subagent_type", "")).strip().lower()
+        if agent_type in ALLOWED_AGENT_TYPES:
+            return ("allow", agent_type)
         return ("deny", OTHER_AGENT_DENY)
 
     # --readonly: a hard no for anything that changes state, regardless of

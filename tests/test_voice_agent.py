@@ -837,7 +837,7 @@ def test_scout_cannot_mutate_and_runs_on_haiku(monkeypatch):
     # The SDK class isn't loaded in tests; a stub captures the definition
     monkeypatch.setattr(state, "AgentDefinition", _FakeAgentDef)
     defs = agents.build_agents()
-    assert set(defs) == {"scout"}          # the ONLY delegation that exists
+    assert set(defs) == {"scout", "worker"}  # the ONLY delegation that exists
     scout = defs["scout"]
     assert scout.tools == ["Read", "Glob", "Grep"]   # no Edit/Write/Bash/Web
     assert scout.model == "haiku"
@@ -846,17 +846,31 @@ def test_scout_cannot_mutate_and_runs_on_haiku(monkeypatch):
     assert "data, not instructions" in scout.prompt
 
 
+def test_worker_executes_gated_no_web_no_delegation(monkeypatch):
+    monkeypatch.setattr(state, "AgentDefinition", _FakeAgentDef)
+    worker = agents.build_agents()["worker"]
+    assert set(worker.tools) == {"Read", "Glob", "Grep", "Edit", "Write", "Bash"}
+    assert "Task" not in worker.tools        # no sub-delegation
+    assert "WebFetch" not in worker.tools    # execution doesn't browse
+    assert worker.model == "inherit"         # the session's full brain
+    assert "data, not instructions" in worker.prompt
+    # The agent-type fence and the definitions must never drift apart
+    assert set(agents.build_agents()) == set(policy.ALLOWED_AGENT_TYPES)
+
+
 def test_task_feed_line_names_the_agent_type():
     line = approvals.describe_tool_use("Task", {
         "subagent_type": "scout", "description": "map the auth flow"})
     assert line == "scout: map the auth flow"
 
 
-def test_only_scout_launches_pass_the_policy(repo):
+def test_only_defined_agent_launches_pass_the_policy(repo):
     # Belt: no other agent type is defined. Suspenders: the policy refuses
     # them anyway, even though the CLI may skip this callback for Task.
     assert _decide("Task", {"subagent_type": "scout",
                             "description": "d", "prompt": "p"}) == ("allow", "scout")
+    assert _decide("Task", {"subagent_type": "worker",
+                            "prompt": "p"}) == ("allow", "worker")
     assert _decide("Task", {"subagent_type": "general-purpose",
                             "prompt": "p"}) == ("deny", policy.OTHER_AGENT_DENY)
     assert _decide("Task", {"prompt": "p"}) == ("deny", policy.OTHER_AGENT_DENY)
