@@ -53,6 +53,10 @@ session_saved = False
 # at startup — fetches anywhere else need a spoken yes, per domain.
 web_allowlist = frozenset()
 
+# Count of in-process tools currently executing something slow (a test
+# run), so the stall watcher doesn't call honest work a hang.
+_tool_busy = 0
+
 # Count of voice approvals in flight or queued, so the barge-in watcher
 # doesn't mistake an answer for "cut Claude off". Parallel tool calls make
 # the permission callback re-enter concurrently; a plain boolean here let

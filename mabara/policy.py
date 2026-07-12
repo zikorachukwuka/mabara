@@ -6,6 +6,7 @@ import re
 from urllib.parse import urlsplit
 
 from . import config, state
+from .tools import PLAN_TOOL, RUN_TESTS_TOOL
 
 READ_ONLY_TOOLS = {"Read", "Glob", "Grep"}
 # NOTE: the CLI runs its own read-only analysis first and auto-approves
@@ -224,6 +225,12 @@ def permission_decision(tool_name, tool_input, *, readonly, task_grants,
         if _within_repo(path):
             return ("allow", "read")
 
+    # propose_plan is always free: the tool IS an approval — it speaks the
+    # plan and takes the verdict itself; gating it would ask permission to
+    # ask permission. It grants nothing until the user says yes into it.
+    if tool_name == PLAN_TOOL:
+        return ("allow", "plan-tool")
+
     # Scout launches are free: a scout can only read, glob, and grep, and
     # every inner call it makes is gated here anyway. Any other agent type
     # is refused outright — the primary fence is that no other type is
@@ -239,7 +246,8 @@ def permission_decision(tool_name, tool_input, *, readonly, task_grants,
     # approvals — for exploring repos that must not be touched. Checked
     # before the read-only Bash allowlist so that, as the flag's help
     # promises, no shell command runs at all in a read-only session.
-    if readonly and tool_name in ("Edit", "Write", "Bash"):
+    # run_tests counts as mutating: test suites execute repo code.
+    if readonly and tool_name in ("Edit", "Write", "Bash", RUN_TESTS_TOOL):
         return ("deny", READONLY_DENY)
 
     if tool_name == "Bash" and is_read_only_bash(str(tool_input.get("command", ""))):

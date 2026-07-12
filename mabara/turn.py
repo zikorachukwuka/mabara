@@ -240,8 +240,9 @@ async def ask_claude(client, text, speaker, label=None):
             await asyncio.sleep(1.0)
             if barged_in:
                 return
-            if state._approvals_pending:
-                # The stream is waiting on the user's yes/no, not hung
+            if state._approvals_pending or state._tool_busy:
+                # Waiting on the user's yes/no, or an in-process tool is
+                # legitimately grinding (a test run) — not a hang
                 last_event = time.time()
                 continue
             quiet = time.time() - last_event

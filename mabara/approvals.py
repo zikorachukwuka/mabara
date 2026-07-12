@@ -61,6 +61,10 @@ def describe_tool_use(name, tool_input):
     if name == "WebSearch":
         query = str(tool_input.get("query", "?"))
         return f'search "{query if len(query) <= 54 else query[:53] + "…"}"'
+    if name == policy.PLAN_TOOL:
+        return f"propose plan: {str(tool_input.get('goal', ''))[:52]}"
+    if name == policy.RUN_TESTS_TOOL:
+        return "run tests"
     return name.lower()
 
 
@@ -178,6 +182,10 @@ def describe_action(tool_name, tool_input, spoken=False):
         if spoken and len(query) > 90:
             query = query[:89] + "…"
         return f'search the web for "{query}"'
+    if tool_name == policy.RUN_TESTS_TOOL:
+        # Only asked when no approved plan covers it — a lone "run the
+        # tests?" is the cheapest approval in the whole flow.
+        return "run this repo's test suite"
     return f"use the tool {tool_name}"
 
 

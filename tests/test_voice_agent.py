@@ -11,7 +11,7 @@ import sys
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from mabara import agents, approvals, commands, context, policy, session, state, text, turn
+from mabara import agents, approvals, commands, context, policy, session, state, text, tools, turn
 from mabara.gitsafety import GitSafety
 
 
@@ -741,6 +741,89 @@ def test_websearch_described_by_query(repo):
     assert approvals.describe_action(
         "WebSearch", {"query": "piper tts sample rate"}) == \
         'search the web for "piper tts sample rate"'
+
+
+# ---------- Plan contract + run_tests (in-process tools) ----------
+
+def test_plan_tool_is_always_allowed(repo):
+    # The tool IS an approval — gating it would ask permission to ask
+    assert _decide(policy.PLAN_TOOL, {"goal": "x"}) == ("allow", "plan-tool")
+
+
+def test_run_tests_needs_a_grant_and_respects_readonly(repo):
+    assert _decide(policy.RUN_TESTS_TOOL, {}) == ("ask", None)
+    # An approved plan installs the grant; it rides the generic branch
+    assert _decide(policy.RUN_TESTS_TOOL, {},
+                   task_grants=set(tools.PLAN_GRANTS)) == ("allow", "task-grant")
+    # Test suites execute repo code: read-only sessions refuse them
+    assert _decide(policy.RUN_TESTS_TOOL, {}, readonly=True,
+                   task_grants=set(tools.PLAN_GRANTS)) == \
+        ("deny", policy.READONLY_DENY)
+
+
+def test_plan_grants_cover_edits_and_tests_only():
+    assert set(tools.PLAN_GRANTS) == {"edits", policy.RUN_TESTS_TOOL}
+
+
+def test_detect_test_command_npm(tmp_path, monkeypatch):
+    (tmp_path / "package.json").write_text(
+        '{"scripts": {"test": "jest"}}', encoding="utf-8")
+    monkeypatch.setattr(tools.shutil, "which",
+                        lambda name: r"C:\fake\npm.cmd" if name == "npm" else None)
+    argv, label = tools.detect_test_command(str(tmp_path))
+    assert argv == [r"C:\fake\npm.cmd", "test"] and label == "npm test"
+
+
+def test_detect_test_command_skips_npm_placeholder(tmp_path, monkeypatch):
+    (tmp_path / "package.json").write_text(
+        '{"scripts": {"test": "echo \\"Error: no test specified\\" && exit 1"}}',
+        encoding="utf-8")
+    monkeypatch.setattr(tools.shutil, "which", lambda name: None)
+    assert tools.detect_test_command(str(tmp_path)) is None
+
+
+def test_detect_test_command_pytest_prefers_repo_venv(tmp_path, monkeypatch):
+    (tmp_path / "tests").mkdir()
+    venv_py = tmp_path / "venv" / "Scripts" / "python.exe"
+    venv_py.parent.mkdir(parents=True)
+    venv_py.write_bytes(b"")
+    monkeypatch.setattr(tools.shutil, "which", lambda name: None)
+    argv, label = tools.detect_test_command(str(tmp_path))
+    assert argv == [str(venv_py), "-m", "pytest"] and label == "pytest"
+
+
+def test_detect_test_command_nothing_found(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools.shutil, "which", lambda name: None)
+    assert tools.detect_test_command(str(tmp_path)) is None
+
+
+def test_summarize_test_output_shapes():
+    assert tools.summarize_test_output(
+        "....\n151 passed in 0.94s\n", 0, "pytest") == \
+        "pytest: 151 passed in 0.94s"
+    assert "2 failed" in tools.summarize_test_output(
+        "=== 2 failed, 10 passed in 1.2s ===", 1, "pytest")
+    assert tools.summarize_test_output(
+        "Tests:       3 passed, 3 total\n", 0, "npm test") == \
+        "npm test: 3 passed, 3 total"
+    assert tools.summarize_test_output("...", 0, "cargo test") == \
+        "cargo test: all tests passed"
+    assert "exit code 2" in tools.summarize_test_output("boom", 2, "go test")
+
+
+def test_run_tests_sync_reports_missing_runner(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools.shutil, "which", lambda name: None)
+    result = tools.run_tests_sync(str(tmp_path))
+    assert "No test runner found" in result
+
+
+def test_mcp_tool_feed_lines(repo):
+    assert approvals.describe_tool_use(
+        policy.PLAN_TOOL, {"goal": "refactor the speaker"}) == \
+        "propose plan: refactor the speaker"
+    assert approvals.describe_tool_use(policy.RUN_TESTS_TOOL, {}) == "run tests"
+    assert approvals.describe_action(policy.RUN_TESTS_TOOL, {}) == \
+        "run this repo's test suite"
 
 
 # ---------- Subagents: the scout is read-only by construction ----------
