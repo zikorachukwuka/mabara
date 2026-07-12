@@ -11,7 +11,7 @@ import sys
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from mabara import approvals, commands, policy, session, state, text, turn
+from mabara import approvals, commands, context, policy, session, state, text, turn
 from mabara.gitsafety import GitSafety
 
 
@@ -654,6 +654,33 @@ def test_feed_shows_out_of_repo_paths_in_full(repo):
     assert approvals.describe_tool_use("Read", {"file_path": inside}) == "read public/app.js"
     # An out-of-repo probe must never be shortened into looking local
     assert outside in approvals.describe_tool_use("Read", {"file_path": outside})
+
+
+# ---------- Project notes (CLAUDE.md read as data, never as settings) ----------
+
+def test_project_notes_missing_is_empty(tmp_path):
+    assert context.project_notes(str(tmp_path)) == ""
+
+
+def test_project_notes_reads_and_labels_both_files(tmp_path):
+    (tmp_path / "CLAUDE.md").write_text("Use tabs.\n", encoding="utf-8")
+    (tmp_path / "CLAUDE.local.md").write_text("Port 5433.\n", encoding="utf-8")
+    notes = context.project_notes(str(tmp_path))
+    assert "--- CLAUDE.md ---" in notes and "Use tabs." in notes
+    assert "--- CLAUDE.local.md ---" in notes and "Port 5433." in notes
+
+
+def test_project_notes_empty_files_count_as_absent(tmp_path):
+    (tmp_path / "CLAUDE.md").write_text("   \n", encoding="utf-8")
+    assert context.project_notes(str(tmp_path)) == ""
+
+
+def test_project_notes_clip_hostile_size(tmp_path):
+    # A repo shipping a book must not crowd the system prompt out of context
+    (tmp_path / "CLAUDE.md").write_text("x" * 100_000, encoding="utf-8")
+    notes = context.project_notes(str(tmp_path))
+    assert len(notes) < context.PROJECT_NOTES_MAX_CHARS + 100
+    assert "clipped" in notes
 
 
 # ---------- Multi-session safety (repo lock + focus gating) ----------
