@@ -112,6 +112,12 @@ async def main():
               f"which model you mean.")
         return
     repo_path = os.path.abspath(args.repo)
+    if not os.path.isdir(repo_path):
+        # Caught here, before any model loads or the SDK spawns the CLI in
+        # a nonexistent cwd (WinError 267 with a 60-line traceback).
+        print(f"  {red('!')} --repo points at a folder that doesn't exist:")
+        print(f"    {repo_path}")
+        return
     state.repo_root = repo_path  # confines auto-approved reads (permission callback)
 
     acquired, other_pid = acquire_repo_lock(repo_path)
