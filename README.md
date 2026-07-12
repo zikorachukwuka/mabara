@@ -136,7 +136,7 @@ Command matchers are deliberately narrow word-allowlists - "how do I undo a comm
                                      for barge-in)    live subtitle)
 ```
 
-One Python file, one process, five threads, no framework. That's deliberate: a real-time voice loop is a *system*, and keeping it in one place kept every latency bug findable.
+One process, five threads, no framework. The code lives in a small package split along its natural seams — `mabara/policy.py` is the pure, unit-tested permission core, `mabara/audio.py` keeps the whole real-time audio loop together (a latency system wants to be read in one place), `mabara/gitsafety.py` is the safety net — with `voice_agent.py` as the single entry point. It began life as one 3,100-line file, deliberately, and was split only once the seams had proven themselves.
 
 ## The decision log (why each part is what it is)
 
