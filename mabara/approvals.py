@@ -65,6 +65,10 @@ def describe_tool_use(name, tool_input):
         return f"propose plan: {str(tool_input.get('goal', ''))[:52]}"
     if name == policy.RUN_TESTS_TOOL:
         return "run tests"
+    if name == policy.REPLACE_TOOL:
+        find = str(tool_input.get("find", "?"))[:24]
+        replace = str(tool_input.get("replace", "?"))[:24]
+        return f'replace "{find}" with "{replace}" everywhere'
     return name.lower()
 
 

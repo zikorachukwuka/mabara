@@ -6,7 +6,7 @@ import re
 from urllib.parse import urlsplit
 
 from . import config, state
-from .tools import PLAN_TOOL, RUN_TESTS_TOOL
+from .tools import PLAN_TOOL, REPLACE_TOOL, RUN_TESTS_TOOL
 
 READ_ONLY_TOOLS = {"Read", "Glob", "Grep"}
 # NOTE: the CLI runs its own read-only analysis first and auto-approves
@@ -254,8 +254,15 @@ def permission_decision(tool_name, tool_input, *, readonly, task_grants,
     # before the read-only Bash allowlist so that, as the flag's help
     # promises, no shell command runs at all in a read-only session.
     # run_tests counts as mutating: test suites execute repo code.
-    if readonly and tool_name in ("Edit", "Write", "Bash", RUN_TESTS_TOOL):
+    if readonly and tool_name in ("Edit", "Write", "Bash",
+                                  RUN_TESTS_TOOL, REPLACE_TOOL):
         return ("deny", READONLY_DENY)
+
+    # replace_text self-gates like propose_plan — it previews and takes
+    # its own spoken yes — so outside readonly it passes freely. It also
+    # refuses itself without a git checkpoint to revert to.
+    if tool_name == REPLACE_TOOL:
+        return ("allow", "self-ask")
 
     if tool_name == "Bash" and is_read_only_bash(str(tool_input.get("command", ""))):
         return ("allow", "bash")

@@ -28,6 +28,7 @@ from .text import speakable
 
 PLAN_TOOL = "mcp__mabara__propose_plan"
 RUN_TESTS_TOOL = "mcp__mabara__run_tests"
+REPLACE_TOOL = "mcp__mabara__replace_text"
 
 # The grant an approved plan installs alongside "edits": the plan names
 # its verification step, so the yes covers running it.
@@ -145,6 +146,165 @@ def run_tests_sync(repo):
     return (f"{summary}\n"
             f"--- last {TEST_OUTPUT_TAIL_LINES} lines ---\n{tail}\n"
             f"(exit code {proc.returncode})")
+
+
+# ---------- Mass text replacement (the bulk-rename instrument) ----------
+# Born from a live failure (2026-07-12): asked to rename a brand string
+# across 61 files, the model batch-read them all into context, overflowed
+# it, the CLI dropped the read results, and every edit bounced off the
+# read-before-edit check. A mechanical same-text replacement must never
+# pass through a context window at all — it is one deterministic
+# operation with one preview and one spoken yes.
+
+REPLACE_PREVIEW_LINES = 12
+
+
+def _repo_text_files(repo):
+    """Tracked plus untracked-but-not-ignored files, straight from git —
+    the honest definition of 'the project', with node_modules, build
+    output, and .git excluded by the repo's own ignore rules."""
+    gs = state.git_safety
+    if gs is None or not gs.enabled:
+        return []
+    files = []
+    for args in (("ls-files",),
+                 ("ls-files", "--others", "--exclude-standard")):
+        proc = gs._git(*args)
+        if proc is not None and proc.returncode == 0:
+            files.extend(line for line in proc.stdout.splitlines()
+                         if line.strip())
+    return files
+
+
+def scan_replacements(repo, find):
+    """[(relpath, count)] of exact-string occurrences, biggest first.
+    Files that don't decode as UTF-8 (binaries) are skipped — this tool
+    only ever touches text it can rewrite losslessly."""
+    hits = []
+    for rel in _repo_text_files(repo):
+        path = os.path.join(repo, rel)
+        try:
+            # newline="" both here and in apply: the bytes must round-trip
+            # exactly — a rename must never churn CRLF/LF line endings.
+            with open(path, "r", encoding="utf-8", newline="") as f:
+                count = f.read().count(find)
+        except (OSError, UnicodeDecodeError, ValueError):
+            continue
+        if count:
+            hits.append((rel, count))
+    hits.sort(key=lambda item: -item[1])
+    return hits
+
+
+def apply_replacements(repo, hits, find, replace, before_write=None):
+    """Rewrite every hit file. before_write(abs_path) runs before each
+    write — the hook GitSafety's checkpoint/backup rides in on. Returns
+    (files_changed, files_failed)."""
+    changed = failed = 0
+    for rel, _count in hits:
+        path = os.path.join(repo, rel)
+        try:
+            with open(path, "r", encoding="utf-8", newline="") as f:
+                content = f.read()
+            if before_write:
+                before_write(os.path.abspath(path))
+            with open(path, "w", encoding="utf-8", newline="") as f:
+                f.write(content.replace(find, replace))
+            changed += 1
+        except (OSError, UnicodeDecodeError, ValueError):
+            failed += 1
+    return changed, failed
+
+
+async def _replace_text_impl(args):
+    """Preview, one spoken yes, replace everywhere under a checkpoint."""
+    find = str(args.get("find", ""))
+    replace = str(args.get("replace", ""))
+    if not find.strip():
+        return _tool_text("Empty search string — nothing to replace.")
+    if state.git_safety is None or not state.git_safety.enabled:
+        return _tool_text(
+            "Replacements are disabled: this folder is not a git "
+            "repository, so there is no checkpoint to revert to. "
+            "Tell the user git init enables it.")
+
+    hits = scan_replacements(state.repo_root, find)
+    if not hits:
+        return _tool_text(f'No occurrences of "{find}" found in the repo.')
+    total = sum(count for _rel, count in hits)
+
+    state._approvals_pending += 1
+    try:
+        async with state._approval_lock:
+            stop_thinking()
+            rule = "-" * 46
+            print(f"\n\n  {yellow('! replace approval')} — Mabara wants to "
+                  f"replace \"{find}\" with \"{replace}\":")
+            print(dim("--[ occurrences ]" + rule[17:]))
+            for rel, count in hits[:REPLACE_PREVIEW_LINES]:
+                print(f"  {rel}  {dim(f'x{count}')}")
+            if len(hits) > REPLACE_PREVIEW_LINES:
+                print(dim(f"  ... +{len(hits) - REPLACE_PREVIEW_LINES} more files"))
+            print(dim(f"  total: {total} occurrences in {len(hits)} files"))
+            print(dim(rule))
+            question = (f'I found {total} occurrences of "{find}" across '
+                        f'{len(hits)} files — the list is on your screen. '
+                        f'Replace them all with "{replace}"? You can revert '
+                        "afterwards.")
+            transcript.append_transcript("Mabara", question)
+            state.speaker.say(speakable(question))
+            await asyncio.to_thread(state.speaker.wait_or_interrupt)
+
+            audio = await asyncio.to_thread(
+                state.recorder.record_while_held,
+                f"hold {config.PTT_LABEL} to answer (yes / no)")
+            if audio is None:
+                clear_status()
+                print(f"  {dim('no answer — not replacing')}\n")
+                return _tool_text(
+                    "No answer was captured — the microphone heard nothing, "
+                    "so this is not a refusal. Ask the user to repeat.")
+            answer = (await asyncio.to_thread(
+                state.stt.transcribe, audio)).lower()
+            clear_status()
+            print(f"  {cyan('You »')} {answer.strip()}")
+            transcript.append_transcript("You", answer.strip())
+
+            if commands.is_affirmative(answer):
+                def before_write(path):
+                    state.git_safety.before_mutation(
+                        "Edit", {"file_path": path})
+                changed, failed = await asyncio.to_thread(
+                    apply_replacements, state.repo_root, hits, find,
+                    replace, before_write)
+                print(f"  {green('replaced')} {dim(f'— {total} occurrences in {changed} files')}")
+                if failed:
+                    print(f"  {dim(f'({failed} files could not be rewritten)')}")
+                print(f"  {dim(f'{CHECK} checkpoint saved — say revert that to undo')}\n")
+                outcome = (f"Done — replaced {total} occurrences of "
+                           f'"{find}" with "{replace}" in {changed} files.')
+                if failed:
+                    outcome += f" {failed} files failed and were left alone."
+                state.speaker.say(speakable(outcome))
+                transcript.append_transcript("Mabara", outcome)
+                return _tool_text(
+                    outcome + " A checkpoint was taken; 'revert that' "
+                    "undoes it. Verify with a grep if it matters.")
+            elif commands.is_plain_denial(answer):
+                print(f"  {dim('not replacing')}\n")
+                state.speaker.say("Okay, leaving everything as it is.")
+                return _tool_text("User declined the replacement. Nothing "
+                                  "was changed. Ask what they'd like.")
+            else:
+                print(f"  {dim('feedback — passed to Mabara')}\n")
+                state.speaker.say("Okay — let me adjust.")
+                return _tool_text(
+                    f'User answered: "{answer.strip()}". Nothing was '
+                    "changed. Treat that as feedback and adjust — perhaps "
+                    "a different search or replacement string.")
+    finally:
+        state._approvals_pending -= 1
+        start_thinking()
 
 
 # ---------- The spoken plan approval ----------
@@ -283,5 +443,16 @@ def build_mcp_server():
         {},
     )(_run_tests_impl)
 
+    replace_text = tool(
+        "replace_text",
+        "Replace an exact text string everywhere in the repo at once — "
+        "renames, rebrandings, URL swaps. Shows the user a preview with "
+        "counts, asks for one spoken approval, then rewrites every file "
+        "under a git checkpoint. ALWAYS use this for a same-text change "
+        "across many files instead of reading and editing files "
+        "one by one — never pull dozens of files into your context.",
+        {"find": str, "replace": str},
+    )(_replace_text_impl)
+
     return create_sdk_mcp_server(name="mabara",
-                                 tools=[propose_plan, run_tests])
+                                 tools=[propose_plan, run_tests, replace_text])

@@ -130,6 +130,10 @@ class SentenceStreamer:
 def describe_result_error(result_text):
     """Turn a raw CLI error result into one short spoken sentence."""
     text = str(result_text or "").strip()
+    if "prompt is too long" in text.lower() or "context low" in text.lower():
+        return ("That step overflowed my context, so nothing got done. "
+                "Ask again and I'll take a lighter approach — smaller "
+                "batches, or the replace tool for bulk renames.")
     if "usage limit" in text.lower() or "rate limit" in text.lower():
         spoken = ("I've hit the Claude usage limit, so I can't respond right "
                   "now. Try again after it resets.")

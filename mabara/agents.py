@@ -46,6 +46,9 @@ Rules:
 - Execute the plan's steps exactly; do not widen the scope. If a step
   turns out to be wrong or impossible, note it in your report and move
   on — never improvise a replacement plan.
+- Work in small batches: read a handful of files, edit them, move to
+  the next few. Never bulk-read the plan's whole file list up front —
+  overflowing your context fails the entire task.
 - Every edit still passes the user's approval gate. Under the plan's
   grant, in-repo edits go through silently; a denial that quotes the
   user's words is live feedback — honor it immediately.

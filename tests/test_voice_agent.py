@@ -826,6 +826,81 @@ def test_mcp_tool_feed_lines(repo):
         "run this repo's test suite"
 
 
+# ---------- Mass replacement (replace_text core) ----------
+
+@pytest.fixture
+def replace_repo(tmp_path, monkeypatch):
+    """A real git repo with tracked, untracked, ignored, and binary files,
+    with state.git_safety pointed at it."""
+    _git(tmp_path, "init")
+    (tmp_path / "a.txt").write_text("Wadata HR one\nWadata HR two\n",
+                                    encoding="utf-8")
+    sub = tmp_path / "sub"
+    sub.mkdir()
+    (sub / "b.md").write_text("Wadata HR three", encoding="utf-8")
+    (tmp_path / "blob.bin").write_bytes(b"\xff\xfeWadata HR\x00")
+    (tmp_path / ".gitignore").write_text("ignored/\n", encoding="utf-8")
+    ignored = tmp_path / "ignored"
+    ignored.mkdir()
+    (ignored / "c.txt").write_text("Wadata HR ignored", encoding="utf-8")
+    _git(tmp_path, "add", "a.txt", "sub/b.md", "blob.bin", ".gitignore")
+    # untracked but not ignored — still part of the project
+    (tmp_path / "untracked.txt").write_text("Wadata HR four", encoding="utf-8")
+    gs = GitSafety(str(tmp_path))
+    monkeypatch.setattr(state, "git_safety", gs)
+    monkeypatch.setattr(state, "repo_root", str(tmp_path))
+    return tmp_path
+
+
+def test_scan_replacements_counts_project_files_only(replace_repo):
+    hits = dict(tools.scan_replacements(str(replace_repo), "Wadata HR"))
+    assert hits == {"a.txt": 2, "sub/b.md": 1, "untracked.txt": 1}
+    # binary skipped (undecodable), ignored/ excluded by git
+
+
+def test_apply_replacements_rewrites_and_reports(replace_repo):
+    hits = tools.scan_replacements(str(replace_repo), "Wadata HR")
+    seen = []
+    changed, failed = tools.apply_replacements(
+        str(replace_repo), hits, "Wadata HR", "MDHR", seen.append)
+    assert (changed, failed) == (3, 0)
+    assert len(seen) == 3                       # checkpoint hook per file
+    assert (replace_repo / "a.txt").read_text(encoding="utf-8") == \
+        "MDHR one\nMDHR two\n"
+    assert (replace_repo / "ignored" / "c.txt").read_text(
+        encoding="utf-8") == "Wadata HR ignored"   # untouched
+    assert tools.scan_replacements(str(replace_repo), "Wadata HR") == []
+
+
+def test_apply_replacements_preserves_crlf(replace_repo):
+    crlf = replace_repo / "crlf.txt"
+    crlf.write_bytes(b"Wadata HR line\r\nplain line\r\n")
+    _git(replace_repo, "add", "crlf.txt")
+    hits = [("crlf.txt", 1)]
+    tools.apply_replacements(str(replace_repo), hits, "Wadata HR", "MDHR")
+    assert crlf.read_bytes() == b"MDHR line\r\nplain line\r\n"
+
+
+def test_replace_tool_policy(repo):
+    # Self-gating: allowed outside readonly (it asks by voice itself)...
+    assert _decide(policy.REPLACE_TOOL, {"find": "a", "replace": "b"}) == \
+        ("allow", "self-ask")
+    # ...but a readonly session refuses it before it can ask
+    assert _decide(policy.REPLACE_TOOL, {"find": "a", "replace": "b"},
+                   readonly=True) == ("deny", policy.READONLY_DENY)
+
+
+def test_replace_feed_line(repo):
+    assert approvals.describe_tool_use(policy.REPLACE_TOOL, {
+        "find": "Wadata HR", "replace": "MDHR"}) == \
+        'replace "Wadata HR" with "MDHR" everywhere'
+
+
+def test_context_overflow_speaks_plainly():
+    spoken = turn.describe_result_error("Error: Prompt is too long")
+    assert "context" in spoken and "nothing got done" in spoken
+
+
 # ---------- Subagents: the scout is read-only by construction ----------
 
 class _FakeAgentDef:
