@@ -211,6 +211,8 @@ async def ask_claude(client, text, speaker, label=None):
     barged_in = False
     tool_calls = 0
     pending_tools = {}  # tool_use id -> (name, started) for outcome markers
+    task_labels = {}    # Task tool-use id -> subagent type, labels the
+                        # child feed lines so scout work reads as scout work
     result_error = None
     last_event = time.time()
 
@@ -294,6 +296,7 @@ async def ask_claude(client, text, speaker, label=None):
                 # line each is what makes the terminal read like work. Tool
                 # results echo back the same way (as user messages), and
                 # Bash/Edit/Write outcomes get their honesty marker.
+                parent_id = getattr(message, "parent_tool_use_id", None)
                 for block in message.content:
                     if hasattr(block, "name") and hasattr(block, "input"):
                         clear_status()
@@ -303,7 +306,19 @@ async def ask_claude(client, text, speaker, label=None):
                             # a "what this was for"
                             shown = label if len(label) <= 64 else label[:63] + "…"
                             print(f"  {accent(DOT)} {dim('task:')} {shown}")
-                        print(f"  {dim(f'{TOOL_MARK} {describe_tool_use(block.name, block.input)}')}")
+                        action = describe_tool_use(block.name, block.input)
+                        if parent_id:
+                            # A subagent's work, indented under its launch
+                            # line and named — scout reads must never look
+                            # like Mabara's own hands on the code.
+                            who = task_labels.get(parent_id, "agent")
+                            print(f"    {dim(f'{TOOL_MARK} {who} {TOOL_MARK} {action}')}")
+                        else:
+                            print(f"  {dim(f'{TOOL_MARK} {action}')}")
+                            if block.name == "Task" and getattr(block, "id", None):
+                                task_labels[block.id] = str(
+                                    block.input.get("subagent_type", "")
+                                    or "agent") if isinstance(block.input, dict) else "agent"
                         tool_calls += 1
                         if getattr(block, "id", None):
                             pending_tools[block.id] = (block.name, time.time())

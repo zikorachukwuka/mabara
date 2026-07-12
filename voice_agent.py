@@ -13,6 +13,7 @@ import time
 
 from mabara import audio as audio_lib
 from mabara import policy, state
+from mabara.agents import build_agents
 from mabara.approvals import voice_permission_callback
 from mabara.commands import (
     _MODEL_ALIASES, is_affirmative, is_commit_command, is_revert_command,
@@ -204,14 +205,6 @@ async def main():
         ticker.stop()  # same as below: keep the spinner off the traceback
         raise
 
-    # Subagents are poison for a real-time voice loop: Task is
-    # auto-approved by the CLI (bypassing voice approval), runs cold and
-    # slow, and background agents finish between turns where nobody is
-    # listening ("still waiting on that agent..."). Haiku especially
-    # loves delegating trivial lookups to them.
-    # NotebookEdit is out entirely: the approval flow can't voice a
-    # notebook diff and GitSafety's revert doesn't track it — a tool the
-    # spoken UX can't honestly describe doesn't belong in the toolset.
     # The repo's own instructions, as data. Read manually (not via the
     # SDK's project setting source) so prose loads but nothing executes.
     notes = project_notes(repo_path)
@@ -234,7 +227,18 @@ async def main():
             shown += f" and {len(state.web_allowlist) - 4} more"
         print(f"  {dim(f'{CHECK} trusted fetch domains: {shown}')}")
 
-    disallowed = ["Task", "NotebookEdit"]
+    # Subagents: generic Task delegation stayed poison (auto-approved by
+    # the CLI, cold, and haiku once delegated trivia into background limbo
+    # — observed 2026-07-05), so Mabara never re-enabled it as-is. What
+    # changed: Mabara now defines its OWN agents (mabara/agents.py) —
+    # currently just the read-only scout — with pinned toolsets and
+    # models; the system prompt forbids every other agent type, and a
+    # subagent's inner tool calls still hit the voice gate like anyone
+    # else's. Scouts run synchronously inside the turn: no backgrounding.
+    # NotebookEdit is out entirely: the approval flow can't voice a
+    # notebook diff and GitSafety's revert doesn't track it — a tool the
+    # spoken UX can't honestly describe doesn't belong in the toolset.
+    disallowed = ["NotebookEdit"]
     if args.readonly:
         # The CLI auto-approves Bash it deems read-only (even compound
         # commands) without consulting can_use_tool, so the callback deny
@@ -258,6 +262,7 @@ async def main():
         # own machine config (and, later, user-level skills); the repo
         # contributes prose only, via project_notes above.
         setting_sources=["user"],
+        agents=build_agents(),
         system_prompt=(
             "You are Mabara, a voice-driven coding agent working directly in "
             "the user's codebase. The user speaks to you and hears your "
@@ -311,9 +316,19 @@ async def main():
             "that's feedback — say in one sentence how you're addressing "
             "it, revise, and request approval again; a bare denial means "
             "drop that call and ask what they'd like instead, never "
-            "retrying the identical request. Always do the work yourself with "
-            "your own tools, in this turn — never launch agents or "
-            "background tasks: the user is on a live voice call with you "
+            "retrying the identical request. You have exactly one subagent "
+            "type: the scout — a fast read-only explorer that can only "
+            "read, glob, and grep this repo. Use scouts ONLY for broad "
+            "questions spanning many files: architecture overviews, "
+            "finding where something is handled across the codebase, "
+            "tracing a flow through unfamiliar code. Before launching any, "
+            "say in one sentence that you're sending scouts and what "
+            "they'll look for; give each ONE sharp question, launch up to "
+            "three in parallel, and when they return, speak the synthesis "
+            "— never read a scout's raw report aloud. Anything a few reads "
+            "would answer, do yourself: never delegate trivial lookups. "
+            "Never launch any agent type other than scout, and never "
+            "background tasks: the user is on a live voice call with you, "
             "and anything that finishes 'later' finishes never.\n\n"
             "Accuracy discipline: never state facts about the codebase — "
             "its stack, dependencies, structure, or behavior — from memory, "

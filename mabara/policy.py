@@ -192,6 +192,11 @@ NO_GIT_DENY = (
     "there is no safety net to undo changes. Tell the user that "
     "running git init in this folder enables editing."
 )
+OTHER_AGENT_DENY = (
+    "That agent type is disabled: the scout is the only subagent here. "
+    "Launch scouts for broad read-only exploration, or do the work "
+    "yourself with your own tools in this turn."
+)
 
 
 def permission_decision(tool_name, tool_input, *, readonly, task_grants,
@@ -218,6 +223,17 @@ def permission_decision(tool_name, tool_input, *, readonly, task_grants,
             path = _glob_pattern_prefix(tool_input.get("pattern", ""))
         if _within_repo(path):
             return ("allow", "read")
+
+    # Scout launches are free: a scout can only read, glob, and grep, and
+    # every inner call it makes is gated here anyway. Any other agent type
+    # is refused outright — the primary fence is that no other type is
+    # DEFINED (mabara/agents.py), but the CLI has been observed skipping
+    # this callback for Task (2026-07-05), so treat this branch as defense
+    # in depth, not the lock on the door.
+    if tool_name == "Task":
+        if str(tool_input.get("subagent_type", "")).strip().lower() == "scout":
+            return ("allow", "scout")
+        return ("deny", OTHER_AGENT_DENY)
 
     # --readonly: a hard no for anything that changes state, regardless of
     # approvals — for exploring repos that must not be touched. Checked

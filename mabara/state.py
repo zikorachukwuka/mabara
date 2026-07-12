@@ -13,17 +13,19 @@ import asyncio
 # touches these names until the loader has finished.
 ClaudeSDKClient = None
 ClaudeAgentOptions = None
+AgentDefinition = None
 PermissionResultAllow = None
 PermissionResultDeny = None
 StreamEvent = None
 
 
 def _load_sdk():
-    global ClaudeSDKClient, ClaudeAgentOptions, \
+    global ClaudeSDKClient, ClaudeAgentOptions, AgentDefinition, \
         PermissionResultAllow, PermissionResultDeny, StreamEvent
     import claude_agent_sdk as sdk
     ClaudeSDKClient = sdk.ClaudeSDKClient
     ClaudeAgentOptions = sdk.ClaudeAgentOptions
+    AgentDefinition = sdk.AgentDefinition
     PermissionResultAllow = sdk.PermissionResultAllow
     PermissionResultDeny = sdk.PermissionResultDeny
     StreamEvent = sdk.StreamEvent

@@ -52,8 +52,9 @@ def describe_tool_use(name, tool_input):
         command = str(tool_input.get("command", "?"))
         return f"run: {command if len(command) <= 56 else command[:55] + '…'}"
     if name == "Task":
+        agent = str(tool_input.get("subagent_type", "") or "agent")
         detail = str(tool_input.get("description", "") or tool_input.get("prompt", ""))
-        return f"agent: {detail[:56]}"
+        return f"{agent}: {detail[:56]}"
     if name == "WebFetch":
         url = str(tool_input.get("url", "?"))
         return f"fetch {policy.url_domain(url) or url[:56]}"
@@ -419,8 +420,12 @@ async def voice_permission_callback(tool_name, tool_input, context):
     def deny_by_policy(detail):
         # The denial prints: a blocked edit that leaves no mark looks
         # exactly like a successful one in the tool feed.
-        blocked = ("blocked (read-only session)" if detail == READONLY_DENY
-                   else "blocked: not a git repository")
+        if detail == READONLY_DENY:
+            blocked = "blocked (read-only session)"
+        elif detail == policy.OTHER_AGENT_DENY:
+            blocked = "blocked: only the scout agent exists"
+        else:
+            blocked = "blocked: not a git repository"
         clear_status()
         print(f"  {red('!')} {dim(describe_tool_use(tool_name, tool_input) + ' — ' + blocked)}")
         return state.PermissionResultDeny(message=detail)

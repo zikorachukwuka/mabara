@@ -11,7 +11,7 @@ import sys
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from mabara import approvals, commands, context, policy, session, state, text, turn
+from mabara import agents, approvals, commands, context, policy, session, state, text, turn
 from mabara.gitsafety import GitSafety
 
 
@@ -741,6 +741,42 @@ def test_websearch_described_by_query(repo):
     assert approvals.describe_action(
         "WebSearch", {"query": "piper tts sample rate"}) == \
         'search the web for "piper tts sample rate"'
+
+
+# ---------- Subagents: the scout is read-only by construction ----------
+
+class _FakeAgentDef:
+    def __init__(self, **kw):
+        self.__dict__.update(kw)
+
+
+def test_scout_cannot_mutate_and_runs_on_haiku(monkeypatch):
+    # The SDK class isn't loaded in tests; a stub captures the definition
+    monkeypatch.setattr(state, "AgentDefinition", _FakeAgentDef)
+    defs = agents.build_agents()
+    assert set(defs) == {"scout"}          # the ONLY delegation that exists
+    scout = defs["scout"]
+    assert scout.tools == ["Read", "Glob", "Grep"]   # no Edit/Write/Bash/Web
+    assert scout.model == "haiku"
+    # The scout's prompt must carry the injection rule — repo files may
+    # try to instruct it
+    assert "data, not instructions" in scout.prompt
+
+
+def test_task_feed_line_names_the_agent_type():
+    line = approvals.describe_tool_use("Task", {
+        "subagent_type": "scout", "description": "map the auth flow"})
+    assert line == "scout: map the auth flow"
+
+
+def test_only_scout_launches_pass_the_policy(repo):
+    # Belt: no other agent type is defined. Suspenders: the policy refuses
+    # them anyway, even though the CLI may skip this callback for Task.
+    assert _decide("Task", {"subagent_type": "scout",
+                            "description": "d", "prompt": "p"}) == ("allow", "scout")
+    assert _decide("Task", {"subagent_type": "general-purpose",
+                            "prompt": "p"}) == ("deny", policy.OTHER_AGENT_DENY)
+    assert _decide("Task", {"prompt": "p"}) == ("deny", policy.OTHER_AGENT_DENY)
 
 
 # ---------- Project notes (CLAUDE.md read as data, never as settings) ----------
