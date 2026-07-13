@@ -110,6 +110,27 @@ def is_read_only_bash(command):
     return True
 
 
+# Commands whose blast radius exceeds "my changes": repo-wide discards
+# and deletes. They still only run with a spoken yes — but the yes must be
+# informed, and "git restore ." sounds harmless while quietly destroying
+# the USER'S own uncommitted work too (observed live 2026-07-13).
+BASH_DESTRUCTIVE_PATTERN = re.compile(
+    r"git\s+(?:restore|checkout)\s+(?:--\s+)?\.(?:\s|$)"
+    r"|git\s+reset\s+--hard"
+    r"|git\s+clean\b"
+    r"|rm\s+-[a-z]*[rf]", re.IGNORECASE)
+
+
+def bash_warning(command):
+    """A spoken caution for commands that can destroy work beyond the
+    task's own changes, or None. A warning, never a silent deny — the
+    user can still say yes, but now they know what they're saying it to."""
+    if BASH_DESTRUCTIVE_PATTERN.search(str(command)):
+        return ("careful — this can discard or delete work across the "
+                "repo, not just my changes")
+    return None
+
+
 # ---------- Web fetches (domains, hygiene, the trusted-domain list) ----------
 
 def url_domain(url):

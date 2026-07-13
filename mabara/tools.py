@@ -289,7 +289,12 @@ async def _replace_text_impl(args):
                 transcript.append_transcript("Mabara", outcome)
                 return _tool_text(
                     outcome + " A checkpoint was taken; 'revert that' "
-                    "undoes it. Verify with a grep if it matters.")
+                    "undoes it. Verify with a grep if it matters — note "
+                    "this tool counts occurrences while grep counts "
+                    "matching lines, so totals can differ when a line "
+                    "contains the text twice. The user already HEARD this "
+                    "result spoken: don't repeat the numbers, just "
+                    "continue.")
             elif commands.is_plain_denial(answer):
                 print(f"  {dim('not replacing')}\n")
                 state.speaker.say("Okay, leaving everything as it is.")
@@ -381,7 +386,9 @@ async def _propose_plan_impl(args):
                     "run_tests tool are pre-approved for the rest of this "
                     "task; shell commands still ask individually. Execute "
                     "the plan step by step, narrating significant steps, "
-                    "and finish by running the verification you promised.")
+                    "and finish by running the verification you promised. "
+                    "The user already heard the approval confirmed — don't "
+                    "re-announce it, start working.")
             elif commands.is_plain_denial(answer):
                 print(f"  {dim('plan declined')}\n")
                 state.speaker.say("Okay, I'll hold off.")

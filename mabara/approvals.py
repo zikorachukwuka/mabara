@@ -153,9 +153,12 @@ def describe_action(tool_name, tool_input, spoken=False):
         return f"{verb} {path or 'unknown file'}{note}"
     if tool_name == "Bash":
         command = tool_input.get("command", "unknown command")
+        warning = policy.bash_warning(command)
         if spoken:
-            return f"run {spoken_command(command)}"
-        return f"run the command: {command}"
+            action = f"run {spoken_command(command)}"
+            return f"{action} — {warning}" if warning else action
+        action = f"run the command: {command}"
+        return f"{action}  [{warning}]" if warning else action
     if tool_name in policy.READ_ONLY_TOOLS:
         # Only reachable when the target is outside the repo — in-repo
         # reads were auto-approved before the question was ever asked.

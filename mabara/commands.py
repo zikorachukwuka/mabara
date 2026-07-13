@@ -4,6 +4,25 @@ models, or reverting still go to Claude as conversation."""
 
 import re
 
+# Spoken commands arrive dressed in politeness and hesitation — "please um
+# revert all the changes you just made" is the same command as "revert
+# that". Leading filler is stripped before the first-word check; missing
+# this once sent a revert request to the model, which improvised
+# `git restore .` — a repo-wide sledgehammer instead of the checkpoint.
+_LEADING_FILLER = {
+    "please", "okay", "ok", "so", "um", "uh", "hey", "now", "alright",
+    "yeah", "mabara", "can", "could", "you", "just",
+}
+
+
+def _command_words(text):
+    words = re.findall(r"[a-z']+", text.lower())
+    i = 0
+    while i < len(words) and words[i] in _LEADING_FILLER:
+        i += 1
+    return words[i:]
+
+
 _COMMIT_WORDS = {
     "commit", "that", "this", "it", "them", "these", "the", "change",
     "changes", "task", "tasks", "work", "edit", "edits", "please", "now",
@@ -13,9 +32,9 @@ _COMMIT_WORDS = {
 def is_commit_command(text):
     """True only for short, unambiguous commands like 'commit this' —
     questions about commits go to Claude as normal conversation."""
-    words = re.findall(r"[a-z']+", text.lower())
+    words = _command_words(text)
     return (bool(words) and words[0] == "commit"
-            and len(words) <= 6 and all(w in _COMMIT_WORDS for w in words))
+            and len(words) <= 8 and all(w in _COMMIT_WORDS for w in words))
 
 
 _MODEL_ALIASES = {
@@ -47,7 +66,7 @@ _SWITCH_FILLER = {
 def model_switch_target(text):
     """'switch to sonnet' → 'sonnet'; None for anything that isn't a short,
     unambiguous switch command (questions about models go to Claude)."""
-    words = re.findall(r"[a-z']+", text.lower())
+    words = _command_words(text)
     if not words or words[0] not in ("switch", "use", "change") or len(words) > 6:
         return None
     models = [_MODEL_ALIASES[w] for w in words if w in _MODEL_ALIASES]
@@ -61,16 +80,17 @@ def model_switch_target(text):
 _REVERT_WORDS = {
     "revert", "undo", "that", "this", "it", "everything", "all", "your",
     "the", "last", "change", "changes", "edit", "edits", "task", "tasks",
-    "please", "now",
+    "please", "now", "you", "just", "made", "um", "uh",
 }
 
 
 def is_revert_command(text):
     """True only for short, unambiguous commands like 'revert that' or
-    'undo your last changes' — anything wordier goes to Claude as usual."""
-    words = re.findall(r"[a-z']+", text.lower())
+    'please revert all the changes you just made' — anything wordier or
+    more specific goes to Claude as usual."""
+    words = _command_words(text)
     return (bool(words) and words[0] in ("revert", "undo")
-            and len(words) <= 6 and all(w in _REVERT_WORDS for w in words))
+            and len(words) <= 8 and all(w in _REVERT_WORDS for w in words))
 
 
 _YES_WORDS = {

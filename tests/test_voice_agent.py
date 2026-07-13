@@ -295,8 +295,20 @@ def test_out_of_repo_edit_is_flagged_in_the_approval_question(repo):
 def test_revert_command_matcher():
     assert commands.is_revert_command("revert that")
     assert commands.is_revert_command("undo your last changes")
+    # Spoken politeness/hesitation must not defeat the intercept — this
+    # exact phrase once fell through to the model, which improvised
+    # `git restore .` (live 2026-07-13)
+    assert commands.is_revert_command("Please um revert all the changes you just made.")
+    assert commands.is_revert_command("okay revert that please")
     assert not commands.is_revert_command("how do I undo a commit?")
     assert not commands.is_revert_command("revert the refactor you did yesterday and explain")
+
+
+def test_leading_filler_stripped_for_all_command_matchers():
+    assert commands.is_commit_command("okay please commit this")
+    assert commands.model_switch_target("please switch to haiku") == "haiku"
+    # Filler words mid-command still can't smuggle content past the gate
+    assert not commands.is_commit_command("please commit the refactor branch")
 
 
 def test_commit_command_matcher():
@@ -899,6 +911,18 @@ def test_replace_feed_line(repo):
 def test_context_overflow_speaks_plainly():
     spoken = turn.describe_result_error("Error: Prompt is too long")
     assert "context" in spoken and "nothing got done" in spoken
+
+
+def test_destructive_bash_gets_a_spoken_warning(repo):
+    for command in ("git restore .", "git checkout .", "git checkout -- .",
+                    "git reset --hard HEAD", "git clean -fd", "rm -rf dist"):
+        assert policy.bash_warning(command) is not None, command
+        spoken = approvals.describe_action("Bash", {"command": command},
+                                           spoken=True)
+        assert "careful" in spoken, command
+    for command in ("git status", "git restore app/page.tsx",
+                    "git checkout feature-branch", "npm install"):
+        assert policy.bash_warning(command) is None, command
 
 
 # ---------- Subagents: the scout is read-only by construction ----------
