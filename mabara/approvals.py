@@ -73,6 +73,8 @@ def describe_tool_use(name, tool_input):
         return f'replace "{find}" with "{replace}" everywhere'
     if name == policy.NOTES_TOOL:
         return "update session notes"
+    if name == "Skill":
+        return f"skill: {tool_input.get('skill', '?')}"
     return name.lower()
 
 

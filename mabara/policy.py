@@ -288,6 +288,12 @@ def permission_decision(tool_name, tool_input, *, readonly, task_grants,
         return ("allow", "plan-tool")
     if tool_name == NOTES_TOOL:
         return ("allow", "notes")
+    # Skill loads are reading the USER'S OWN instruction files: skills
+    # discover only from ~/.claude (setting_sources pinned to "user"),
+    # never from a target repo — so loading one is trusted, and safe
+    # even in readonly.
+    if tool_name == "Skill":
+        return ("allow", "skill")
 
     # Scout launches are free: a scout can only read, glob, and grep, and
     # every inner call it makes is gated here anyway. Any other agent type

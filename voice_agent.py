@@ -28,6 +28,7 @@ from mabara.gitsafety import GitSafety
 from mabara.session import (
     _repo_lock_file, acquire_repo_lock, release_repo_lock, terminal_focus,
 )
+from mabara.skills import SKILL_NAMES, sync_skills
 from mabara.terminal import (
     CHECK, DOT, GREETING_RESUME, GREETINGS, LOADING_PHASES, TIPS, Ticker,
     animate_banner, clear_status, cyan, dim, green, last_turn_view, red,
@@ -228,6 +229,12 @@ async def main():
                 f.write(policy.WEB_ALLOWLIST_TEMPLATE)
         except OSError:
             pass
+    # Mabara's skills: canonical copies in the repo's skills/ folder,
+    # synced into ~/.claude/skills where the CLI discovers user skills.
+    installed = sync_skills()
+    if installed:
+        print(f"  {dim(f'{CHECK} skills installed/updated: ' + ', '.join(installed))}")
+
     state.web_allowlist = policy.load_web_allowlist()
     if state.web_allowlist:
         shown = ", ".join(sorted(state.web_allowlist)[:4])
@@ -272,6 +279,10 @@ async def main():
         setting_sources=["user"],
         agents=build_agents(),
         mcp_servers={"mabara": build_mcp_server()},
+        # Only Mabara's own skills — the rule-in-prompt/craft-in-skill
+        # split keeps the system prompt lean while the detailed HOW for
+        # testing, teaching, and recaps loads on demand.
+        skills=list(SKILL_NAMES),
         system_prompt=(
             "You are Mabara, a voice-driven coding agent working directly in "
             "the user's codebase. The user speaks to you and hears your "
@@ -432,9 +443,13 @@ async def main():
             "planned work you already ran it; for small unplanned edits, "
             "offer to run the tests rather than doing it unasked. If "
             "something you tried didn't work, say so directly and what "
-            "you're trying instead. When the user asks you to explain or "
-            "teach, shift into full tutor mode: unhurried, thorough, "
-            "spoken explanation."
+            "you're trying instead.\n\n"
+            "Skills — load the matching guide with the Skill tool BEFORE "
+            "the work, and follow it: mabara-testing before writing or "
+            "updating any tests; mabara-teach when the user wants to "
+            "genuinely learn something rather than get a quick answer; "
+            "mabara-recap when the user asks to recap, wrap up, or end "
+            "the session."
             + (f"\n\nYour working directory is {repo_path}. Every relative "
                "path resolves there and Bash commands already run from it — "
                "never prefix commands with cd, and never guess at other "

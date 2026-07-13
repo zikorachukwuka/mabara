@@ -11,7 +11,7 @@ import sys
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from mabara import agents, approvals, commands, context, policy, session, state, text, tools, turn
+from mabara import agents, approvals, commands, context, policy, session, skills, state, text, tools, turn
 from mabara.gitsafety import GitSafety
 
 
@@ -1094,6 +1094,41 @@ def test_agent_feed_line_covers_both_launcher_names():
         line = approvals.describe_tool_use(launcher, {
             "subagent_type": "worker", "description": "execute the plan"})
         assert line == "worker: execute the plan"
+
+
+# ---------- Skills (repo-canonical, synced to the user dir) ----------
+
+def test_sync_skills_installs_then_noops(tmp_path):
+    dest = str(tmp_path / "userskills")
+    # First run installs all three from the repo's canonical copies
+    installed = skills.sync_skills(dest_dir=dest)
+    assert installed == skills.SKILL_NAMES
+    for name in skills.SKILL_NAMES:
+        body = (tmp_path / "userskills" / name / "SKILL.md").read_text(
+            encoding="utf-8")
+        assert f"name: {name}" in body
+    # Second run: everything current, nothing copied
+    assert skills.sync_skills(dest_dir=dest) == []
+    # A drifted install gets re-synced back to canonical
+    drifted = tmp_path / "userskills" / skills.SKILL_NAMES[0] / "SKILL.md"
+    drifted.write_text("tampered", encoding="utf-8")
+    assert skills.sync_skills(dest_dir=dest) == [skills.SKILL_NAMES[0]]
+
+
+def test_sync_skills_fails_soft(tmp_path):
+    # Missing sources must never block startup
+    assert skills.sync_skills(source_dir=str(tmp_path / "nowhere"),
+                              dest_dir=str(tmp_path / "d")) == []
+
+
+def test_skill_loads_are_free_even_readonly(repo):
+    # Skills discover only from ~/.claude (setting_sources=["user"]) —
+    # loading one is reading the user's own instruction file
+    assert _decide("Skill", {"skill": "mabara-teach"}) == ("allow", "skill")
+    assert _decide("Skill", {"skill": "mabara-teach"},
+                   readonly=True) == ("allow", "skill")
+    assert approvals.describe_tool_use(
+        "Skill", {"skill": "mabara-recap"}) == "skill: mabara-recap"
 
 
 # ---------- Session notes (the agent's per-repo notebook) ----------
