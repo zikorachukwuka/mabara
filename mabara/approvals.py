@@ -11,7 +11,9 @@ import subprocess
 import time
 
 from . import config, policy, state, transcript
-from .commands import grants_whole_task, is_affirmative, is_plain_denial
+from .commands import (
+    grants_whole_task, is_affirmative, is_plain_denial, is_question,
+)
 from .policy import READONLY_DENY, _path_within, _within_repo
 from .session import terminal_focus
 from .terminal import (
@@ -417,7 +419,8 @@ async def voice_permission_callback(tool_name, tool_input, context):
             tool_name, tool_input, readonly=state.readonly_mode,
             task_grants=state._task_grants,
             git_enabled=state.git_safety.enabled,
-            web_allowlist=state.web_allowlist)
+            web_allowlist=state.web_allowlist,
+            plan_files=state.plan_files)
 
     def allow_by_grant():
         # The diff still prints when nobody is asked: an unseen edit
@@ -449,7 +452,8 @@ async def voice_permission_callback(tool_name, tool_input, context):
 
     verdict, detail = decide()
     if verdict == "allow":
-        return allow_by_grant() if detail == "task-grant" else state.PermissionResultAllow()
+        return (allow_by_grant() if detail in ("task-grant", "plan-grant")
+                else state.PermissionResultAllow())
     if verdict == "deny":
         return deny_by_policy(detail)
 
@@ -474,7 +478,9 @@ async def voice_permission_callback(tool_name, tool_input, context):
             # searches approves the other four right here.
             verdict, detail = decide()
             if verdict == "allow":
-                return allow_by_grant() if detail == "task-grant" else state.PermissionResultAllow()
+                return (allow_by_grant()
+                        if detail in ("task-grant", "plan-grant")
+                        else state.PermissionResultAllow())
             if verdict == "deny":
                 return deny_by_policy(detail)
 
@@ -581,6 +587,21 @@ async def voice_permission_callback(tool_name, tool_input, context):
                     "User declined via voice. Do not retry this tool call — "
                     "if you can't proceed without it, ask the user what "
                     "they'd like instead."))
+            elif is_question(answer):
+                # The user is talking TO Mabara, not answering the ask.
+                # Crucially: the change itself is NOT being criticized —
+                # 'did you hand over to the worker?' as revise-feedback
+                # once made the worker rewrite the same file three times.
+                spoken = answer.strip()
+                print(f"  {dim('question — answer it, then re-ask unchanged')}\n")
+                transcript.append_transcript("Mabara", "Good question — one sec.")
+                state.speaker.say("Good question — one sec.")
+                return state.PermissionResultDeny(message=(
+                    f'The user asked a question instead of answering: '
+                    f'"{spoken}". Answer it out loud plainly first. Then '
+                    "request the SAME tool call again, byte-identical — "
+                    "a question is not criticism of the change, so do "
+                    "not revise it."))
             else:
                 # The answer carried more than a no — a correction, a
                 # condition, a redirection. Forward the words instead of

@@ -380,7 +380,15 @@ async def main():
             "one sentence of lead-in — don't recite the plan in prose "
             "first. An approved plan pre-approves this task's in-repo "
             "edits and the test run; shell commands still ask one at a "
-            "time. If the answer carries feedback, revise and propose "
+            "time. Every plan declares its executor: set executor to "
+            "'worker' for four or more files or a long grind — the user "
+            "hears who will execute at approval, and a worker plan hands "
+            "off immediately after the yes, not after you've started. "
+            "An approved plan's grant covers its NAMED files and "
+            "persists across turns until the plan is replaced, reverted, "
+            "or committed — so questions mid-plan don't cost approvals; "
+            "answer them and keep executing. If the answer carries "
+            "feedback, revise and propose "
             "again WITH revision_note set to one sentence on what changed "
             "— the tool then speaks only the change, never the full plan "
             "again; if the feedback was really just a go-ahead in other "
@@ -511,6 +519,7 @@ async def main():
                 # instant, and no model in the loop for the undo itself.
                 if is_revert_command(text):
                     summary = git_safety.revert()
+                    state.plan_files = frozenset()  # the plan died with its work
                     print(f"  {green(CHECK)} {dim(summary)}")
                     append_transcript("Mabara", summary)
                     speaker.say(summary)
@@ -551,6 +560,7 @@ async def main():
                     print(f"  {cyan('You »')} {answer.strip() or '(no answer)'}")
                     if is_affirmative(answer):
                         outcome = git_safety.commit(subject)
+                        state.plan_files = frozenset()  # committed = plan complete
                         print(f"  {green(CHECK)} {dim(outcome)}")
                         speaker.say(outcome)
                         pending_note = ("[Note: the user committed your recent "

@@ -205,11 +205,13 @@ def test_symlink_inside_repo_cannot_point_out(repo):
 # ---------- Permission policy core (permission_decision) ----------
 
 def _decide(tool, tool_input, readonly=False, task_grants=frozenset(),
-            git_enabled=True, web_allowlist=frozenset()):
+            git_enabled=True, web_allowlist=frozenset(),
+            plan_files=frozenset()):
     return policy.permission_decision(tool, tool_input, readonly=readonly,
                                       task_grants=task_grants,
                                       git_enabled=git_enabled,
-                                      web_allowlist=web_allowlist)
+                                      web_allowlist=web_allowlist,
+                                      plan_files=plan_files)
 
 
 def test_reads_inside_repo_auto_approve(repo):
@@ -782,6 +784,59 @@ def test_run_tests_needs_a_grant_and_respects_readonly(repo):
 
 def test_plan_grants_cover_edits_and_tests_only():
     assert set(tools.PLAN_GRANTS) == {"edits", policy.RUN_TESTS_TOOL}
+
+
+def test_plan_file_grant_is_file_scoped_and_turn_proof(repo):
+    # The persistent grant: ONLY the files the user heard named at plan
+    # approval — passed explicitly, so it survives turn boundaries by
+    # construction (nothing clears it between turns)
+    planned = tools.plan_file_set(
+        "portfolio-1.html, portfolio-2.html", str(repo))
+    inside = {"file_path": str(repo / "portfolio-1.html")}
+    off_plan = {"file_path": str(repo / "other.html")}
+    assert _decide("Write", inside, plan_files=planned) == ("allow", "plan-grant")
+    assert _decide("Edit", inside, plan_files=planned) == ("allow", "plan-grant")
+    assert _decide("Write", off_plan, plan_files=planned) == ("ask", None)
+    # No active plan: everything asks as before
+    assert _decide("Write", inside) == ("ask", None)
+    # The plan keeps its promised verification runnable across turns too
+    assert _decide(policy.RUN_TESTS_TOOL, {},
+                   plan_files=planned) == ("allow", "plan-grant")
+
+
+def test_plan_file_grant_never_leaves_the_repo(repo):
+    # A plan naming an out-of-repo file must not smuggle a grant out
+    outside = os.path.expanduser("~/.bashrc")
+    planned = tools.plan_file_set(outside, str(repo))
+    assert _decide("Write", {"file_path": outside},
+                   plan_files=planned) == ("ask", None)
+
+
+def test_plan_file_set_parses_model_strings(repo):
+    paths = tools.plan_file_set(
+        'a.html, "b.html"\nsub/c.html', str(repo))
+    expected = {os.path.normcase(str(repo / name))
+                for name in ("a.html", "b.html", os.path.join("sub", "c.html"))}
+    assert paths == expected
+    assert tools.plan_file_set("(unspecified)", str(repo)) == frozenset()
+
+
+def test_question_answers_are_not_revise_feedback():
+    assert commands.is_question("did you hand over to the worker?")
+    assert commands.is_question("who is doing the work, is it you or the worker?")
+    assert commands.is_question("um what does this change")
+    assert not commands.is_question("yes")
+    assert not commands.is_question("no, use port five instead")
+
+
+def test_plan_question_names_the_worker_executor():
+    spoken = tools.plan_spoken_question(
+        "Build five sites", "1. a\n2. b", "structure check",
+        executor="worker")
+    assert "The worker will execute it." in spoken
+    solo = tools.plan_spoken_question(
+        "Build five sites", "1. a\n2. b", "structure check", executor="me")
+    assert "worker" not in solo
 
 
 def test_plan_question_speaks_contract_not_steps():

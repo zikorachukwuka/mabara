@@ -148,6 +148,26 @@ def is_plain_denial(answer):
                for w in words)
 
 
+# An approval answer that opens like a question is the user talking TO
+# Mabara, not answering the ask — "did you hand over to the worker?" once
+# became denial-feedback that made the worker rewrite the same file three
+# times (live 2026-07-13). Question-shaped answers get an answer-first
+# denial: address the human, then re-request the same call unchanged.
+_QUESTION_STARTERS = {
+    "what", "why", "who", "whose", "which", "how", "where", "when",
+    "did", "do", "does", "is", "are", "was", "were", "will", "would",
+    "can", "could", "should", "have", "has", "am",
+}
+
+
+def is_question(answer):
+    """True when a spoken approval answer opens like a question (leading
+    filler skipped). STT gives no punctuation — the first content word is
+    the honest signal."""
+    words = _command_words(answer)
+    return bool(words) and words[0] in _QUESTION_STARTERS
+
+
 _TASK_GRANT_WORDS = {"task", "everything", "all"}
 
 

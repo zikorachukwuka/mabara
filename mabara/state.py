@@ -79,3 +79,15 @@ _pending_asks = {}
 # during any other tool's approval it adds that tool's name, so a task that
 # needs five web searches needs one yes, not five. Bash never rides a grant.
 _task_grants = set()
+
+# The approved plan's file set (normalized absolute paths) — unlike
+# _task_grants this SURVIVES turn boundaries, because plans legitimately
+# span turns (interruptions, questions, usage-limit blips). Observed live
+# 2026-07-13: the plan was approved, a limit error and two questions
+# passed, and by the time the worker executed, the turn-scoped grant was
+# gone — every write voice-asked and the user's questions were eaten as
+# denials. Scope is the tradeoff for persistence: ONLY the files the
+# user heard named in the plan, still repo-confined, diffs still print.
+# Cleared by: a newly approved plan (replaces), 'revert that', 'commit
+# this', or session end.
+plan_files = frozenset()

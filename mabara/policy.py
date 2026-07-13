@@ -73,6 +73,18 @@ def _glob_pattern_prefix(pattern):
     return re.split(r"[*?\[]", pattern)[0] or pattern
 
 
+def plan_match_path(path):
+    """Normalize a tool-input path for matching against the approved
+    plan's file set. Relative paths resolve against the repo (the SDK
+    runs tools with cwd=repo, not Mabara's own cwd)."""
+    path = os.path.expanduser(str(path))
+    if not os.path.isabs(path):
+        if state.repo_root is None:
+            return None
+        path = os.path.join(state.repo_root, path)
+    return os.path.normcase(os.path.abspath(path))
+
+
 def _bash_arg_within_repo(token):
     """Repo confinement for a cat/type argument. Relative paths resolve
     against the repo because the SDK runs Bash with cwd=repo."""
@@ -241,7 +253,8 @@ BACKGROUND_AGENT_DENY = (
 
 
 def permission_decision(tool_name, tool_input, *, readonly, task_grants,
-                        git_enabled, web_allowlist=frozenset()):
+                        git_enabled, web_allowlist=frozenset(),
+                        plan_files=frozenset()):
     """The policy core of voice_permission_callback, kept free of I/O and
     mutable session state so tests can pin every branch of the most
     security-critical decision in the project. task_grants is the set of
@@ -325,6 +338,20 @@ def permission_decision(tool_name, tool_input, *, readonly, task_grants,
     if (tool_name in ("Edit", "Write") and "edits" in task_grants
             and _within_repo(tool_input.get("file_path"))):
         return ("allow", "task-grant")
+
+    # The approved plan's grant: scoped to the files the user heard named
+    # at approval, and it PERSISTS across turns — a plan interrupted by a
+    # question or a limit error is still the same approved plan. Still
+    # repo-confined; anything off the plan's list asks like always.
+    if tool_name in ("Edit", "Write") and plan_files:
+        path = tool_input.get("file_path")
+        if (path and plan_match_path(path) in plan_files
+                and _within_repo(path)):
+            return ("allow", "plan-grant")
+
+    # An active plan also keeps its promised verification runnable.
+    if tool_name == RUN_TESTS_TOOL and plan_files:
+        return ("allow", "plan-grant")
 
     # Fetches are gated by DOMAIN, not by tool: a "yes to all" given on
     # docs.python.org must not cover an injected redirect to evil.com —

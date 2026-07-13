@@ -339,13 +339,30 @@ async def _update_notes_impl(args):
 
 # ---------- The spoken plan approval ----------
 
-def _print_plan(goal, steps, files, verification):
+def plan_file_set(files, repo):
+    """The plan's files field (a comma/newline-separated string from the
+    model) as normalized absolute paths — the persistent grant's scope."""
+    paths = set()
+    for token in re.split(r"[,\n]", str(files)):
+        token = token.strip().strip('"').strip("'")
+        if not token or token.startswith("("):
+            continue
+        path = os.path.expanduser(token)
+        if not os.path.isabs(path):
+            path = os.path.join(repo, path)
+        paths.add(os.path.normcase(os.path.abspath(path)))
+    return frozenset(paths)
+
+
+def _print_plan(goal, steps, files, verification, executor=""):
     rule = "-" * 46
     clear_status()
     print(dim("--[ plan ]" + rule[10:]))
     lines = [f"goal: {goal}", "steps:"]
     lines += [f"  {line}" for line in str(steps).strip().splitlines()]
     lines += [f"files: {files}", f"verify: {verification}"]
+    if executor:
+        lines.append(f"executor: {executor}")
     for line in lines[:PLAN_MAX_PRINT_LINES]:
         print(f"  {line}")
     if len(lines) > PLAN_MAX_PRINT_LINES:
@@ -357,7 +374,8 @@ def _tool_text(text):
     return {"content": [{"type": "text", "text": text}]}
 
 
-def plan_spoken_question(goal, steps, verification, revision_note=""):
+def plan_spoken_question(goal, steps, verification, revision_note="",
+                         executor=""):
     """What the plan approval says out loud: the CONTRACT — goal, step
     count, verification — never the step-by-step, which is on screen
     (same split as diffs: 'the diff is on your screen'). The listener can
@@ -369,7 +387,9 @@ def plan_spoken_question(goal, steps, verification, revision_note=""):
                 "The full plan is on your screen. Do you approve the plan?")
     n = len([s for s in str(steps).splitlines() if s.strip()])
     count = "one step" if n == 1 else f"{n} steps"
-    return (f"Here's the plan — {count}. {goal}. "
+    hands = (" The worker will execute it."
+             if str(executor).strip().lower() == "worker" else "")
+    return (f"Here's the plan — {count}. {goal}.{hands} "
             f"I'll verify by: {verification}. The full steps are on your "
             "screen. Approve the plan, or say read it out to hear the steps.")
 
@@ -401,6 +421,7 @@ async def _propose_plan_impl(args):
     files = str(args.get("files", "")).strip() or "(unspecified)"
     verification = str(args.get("verification", "")).strip() or "(none given)"
     revision_note = str(args.get("revision_note", "")).strip()
+    executor = str(args.get("executor", "")).strip().lower()
 
     state._approvals_pending += 1
     try:
@@ -409,9 +430,9 @@ async def _propose_plan_impl(args):
             banner = ("! plan approval (revised)" if revision_note
                       else "! plan approval")
             print(f"\n\n  {yellow(banner)} — Mabara proposes:")
-            _print_plan(goal, steps, files, verification)
+            _print_plan(goal, steps, files, verification, executor)
             question = plan_spoken_question(goal, steps, verification,
-                                            revision_note)
+                                            revision_note, executor)
             spoken_question = speakable(question)
             transcript.append_transcript("Mabara", spoken_question)
             state.speaker.say(spoken_question)
@@ -457,19 +478,30 @@ async def _propose_plan_impl(args):
             if commands.is_affirmative(answer):
                 for grant in PLAN_GRANTS:
                     state._task_grants.add(grant)
-                print(f"  {green('plan approved')} {dim('— edits and the test run are pre-approved for this task')}")
+                # The persistent half: the plan's named files stay granted
+                # across turns until this plan is replaced, reverted, or
+                # committed — a question or a limit blip mid-plan must not
+                # strand the execution behind per-file asks again.
+                state.plan_files = plan_file_set(files, state.repo_root)
+                print(f"  {green('plan approved')} {dim('— the plan-named files and the test run are pre-approved until this plan is replaced, reverted, or committed')}")
                 print(f"  {dim(CHECK + ' every change still prints its diff, and gets a checkpoint')}\n")
                 confirmation = "Plan approved — I'll get to work."
                 transcript.append_transcript("Mabara", confirmation)
                 state.speaker.say(confirmation)
+                handoff = (" You declared the worker as executor: hand the "
+                           "full plan text to the worker NOW, with "
+                           "run_in_background false."
+                           if executor == "worker" else "")
                 return _tool_text(
-                    "Plan APPROVED by voice. Edits inside this repo and the "
-                    "run_tests tool are pre-approved for the rest of this "
-                    "task; shell commands still ask individually. Execute "
-                    "the plan step by step, narrating significant steps, "
-                    "and finish by running the verification you promised. "
-                    "The user already heard the approval confirmed — don't "
-                    "re-announce it, start working.")
+                    "Plan APPROVED by voice. Edits to the plan's named "
+                    "files and the run_tests tool are pre-approved — even "
+                    "across turns — until this plan is replaced, reverted, "
+                    "or committed; anything off the plan's file list, and "
+                    "every shell command, still asks. Execute step by "
+                    "step, narrating significant steps, and finish with "
+                    "the verification you promised. The user already "
+                    "heard the approval confirmed — don't re-announce it, "
+                    "start working." + handoff)
             elif commands.is_plain_denial(answer):
                 print(f"  {dim('plan declined')}\n")
                 state.speaker.say("Okay, I'll hold off.")
@@ -522,9 +554,11 @@ def build_mcp_server():
         "RE-proposal after feedback, set revision_note to one short "
         "sentence saying what changed (leave it empty on a first "
         "proposal) — the tool then speaks only the change, never the "
-        "whole plan again.",
+        "whole plan again. Set executor to 'worker' for plans of four or "
+        "more files or long grinds (hand off immediately after "
+        "approval), 'me' otherwise — the user hears who will execute.",
         {"goal": str, "steps": str, "files": str, "verification": str,
-         "revision_note": str},
+         "revision_note": str, "executor": str},
     )(_propose_plan_impl)
 
     run_tests = tool(
