@@ -38,6 +38,10 @@ from mabara.gitsafety import GitSafety
     "yes, i approve.",
     "i said i approve, yes.",
     "i said yes",
+    # Natural approvals after a plan-revision round (live 2026-07-13)
+    "continue",
+    "proceed",
+    "okay continue",
 ])
 def test_affirmative_answers_approve(answer):
     assert commands.is_affirmative(answer)
@@ -73,6 +77,9 @@ def test_affirmative_answers_approve(answer):
     "where does this go",
     "sure, but explain it first",
     "okay run all of them?",
+    # 'continue' is a yes word now, but content still breaks the approval:
+    # this exact utterance must stay feedback, not consent
+    "continue, you don't need to reread your plan",
 ])
 def test_non_affirmative_answers_deny(answer):
     assert not commands.is_affirmative(answer)
@@ -775,6 +782,21 @@ def test_run_tests_needs_a_grant_and_respects_readonly(repo):
 
 def test_plan_grants_cover_edits_and_tests_only():
     assert set(tools.PLAN_GRANTS) == {"edits", policy.RUN_TESTS_TOOL}
+
+
+def test_plan_question_speaks_full_plan_first_delta_after():
+    first = tools.plan_spoken_question(
+        "Rename the module", "1. Do a thing\n2. Do another",
+        "run the tests")
+    assert "Here's my plan" in first and "Do a thing" in first
+    revised = tools.plan_spoken_question(
+        "Rename the module", "1. Do a thing\n2. Do another",
+        "grep for the pattern",
+        revision_note="verification is now a grep check")
+    # A re-proposal never re-reads the plan — only what changed
+    assert "Do a thing" not in revised
+    assert "verification is now a grep check" in revised
+    assert "Do you approve the plan?" in revised
 
 
 def test_detect_test_command_npm(tmp_path, monkeypatch):

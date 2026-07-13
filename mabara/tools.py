@@ -332,6 +332,22 @@ def _tool_text(text):
     return {"content": [{"type": "text", "text": text}]}
 
 
+def plan_spoken_question(goal, steps, verification, revision_note=""):
+    """What the plan approval says out loud. A first proposal speaks the
+    whole plan; a RE-proposal after feedback speaks only what changed —
+    re-reading an unchanged plan three times fatigued a live user into
+    answering 'continue, you don't need to reread your plan', which the
+    fail-closed gate (correctly) refused to count as a yes."""
+    if str(revision_note).strip():
+        return (f"Updated plan — {str(revision_note).strip()}. "
+                "The full plan is on your screen. Do you approve the plan?")
+    spoken_steps = " Then ".join(
+        s.strip(" -•") for s in str(steps).splitlines() if s.strip())
+    return (f"Here's my plan. {goal}. {spoken_steps}. "
+            f"I'll verify by: {verification}. "
+            "It's on your screen too. Do you approve the plan?")
+
+
 async def _propose_plan_impl(args):
     """Speak the plan, collect the spoken verdict, convert a yes into the
     task grants. Mirrors voice_permission_callback's concurrency shape:
@@ -341,18 +357,18 @@ async def _propose_plan_impl(args):
     steps = str(args.get("steps", "")).strip() or "(no steps)"
     files = str(args.get("files", "")).strip() or "(unspecified)"
     verification = str(args.get("verification", "")).strip() or "(none given)"
+    revision_note = str(args.get("revision_note", "")).strip()
 
     state._approvals_pending += 1
     try:
         async with state._approval_lock:
             stop_thinking()
-            print(f"\n\n  {yellow('! plan approval')} — Mabara proposes:")
+            banner = ("! plan approval (revised)" if revision_note
+                      else "! plan approval")
+            print(f"\n\n  {yellow(banner)} — Mabara proposes:")
             _print_plan(goal, steps, files, verification)
-            spoken_steps = " Then ".join(
-                s.strip(" -•") for s in steps.splitlines() if s.strip())
-            question = (f"Here's my plan. {goal}. {spoken_steps}. "
-                        f"I'll verify by: {verification}. "
-                        "It's on your screen too. Do you approve the plan?")
+            question = plan_spoken_question(goal, steps, verification,
+                                            revision_note)
             spoken_question = speakable(question)
             transcript.append_transcript("Mabara", spoken_question)
             state.speaker.say(spoken_question)
@@ -437,8 +453,13 @@ def build_mcp_server():
         "BEFORE starting work that spans several files or steps. The tool "
         "reads the plan aloud and returns the user's verdict. An approved "
         "plan pre-approves this task's in-repo edits and the run_tests "
-        "verification; shell commands still ask individually.",
-        {"goal": str, "steps": str, "files": str, "verification": str},
+        "verification; shell commands still ask individually. On a "
+        "RE-proposal after feedback, set revision_note to one short "
+        "sentence saying what changed (leave it empty on a first "
+        "proposal) — the tool then speaks only the change, never the "
+        "whole plan again.",
+        {"goal": str, "steps": str, "files": str, "verification": str,
+         "revision_note": str},
     )(_propose_plan_impl)
 
     run_tests = tool(

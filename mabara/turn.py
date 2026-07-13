@@ -185,6 +185,10 @@ ACKNOWLEDGMENTS = ["On it.", "Okay.", "Alright.", "One sec.", "Got it."]
 # "slow" and "stuck" must stop looking identical on the status line.
 STALL_WARN_SECS = 30
 STALL_HINT_SECS = 90
+# With a subagent live, "may be stuck" waits much longer: a worker
+# composing a 550-line file streams nothing and isn't stuck (observed
+# live 2026-07-13 — the hint told the user to kill honest work)
+STALL_AGENT_HINT_SECS = 240
 
 
 def _fmt_secs(secs):
@@ -250,16 +254,26 @@ async def ask_claude(client, text, speaker, label=None):
                 last_event = time.time()
                 continue
             quiet = time.time() - last_event
+            # An active subagent composing a large file streams nothing
+            # for long stretches — that's work, not a hang. Warn softer
+            # and escalate to "may be stuck" much later.
+            agent_running = bool(task_labels)
+            hint_at = STALL_AGENT_HINT_SECS if agent_running else STALL_HINT_SECS
             if quiet < STALL_WARN_SECS:
                 warned = 0  # events resumed; re-arm for a later stall
             elif warned == 0:
                 warned = 1
                 clear_status()
-                print(f"  {dim(f'(nothing from Claude in {int(quiet)}s — still waiting)')}")
-                spoken = "Still with you — this is taking longer than usual."
+                if agent_running:
+                    print(f"  {dim(f'(the agent is composing — long writes stream nothing; {int(quiet)}s quiet)')}")
+                    spoken = ("The agent's still at it — big files write "
+                              "out silently. Hang tight.")
+                else:
+                    print(f"  {dim(f'(nothing from Claude in {int(quiet)}s — still waiting)')}")
+                    spoken = "Still with you — this is taking longer than usual."
                 transcript.append_transcript("Mabara", spoken)
                 speaker.say(spoken)
-            elif warned == 1 and quiet >= STALL_HINT_SECS:
+            elif warned == 1 and quiet >= hint_at:
                 warned = 2
                 clear_status()
                 print(f"  {dim(f'(no response for {int(quiet)}s — hold {PTT_LABEL} and speak to cut this off)')}")

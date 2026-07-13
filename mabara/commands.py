@@ -97,6 +97,9 @@ _YES_WORDS = {
     "yes", "yeah", "yep", "yup", "sure", "okay", "ok", "go", "ahead",
     "approve", "approved", "affirmative", "do", "alright", "fine",
     "absolutely", "definitely", "course",
+    # Natural after a plan revision round: "continue" was said as a plain
+    # approval and fell to the feedback path (live 2026-07-13)
+    "continue", "proceed",
 }
 _NO_WORDS = {
     "no", "nope", "nah", "not", "don't", "dont", "stop", "deny", "denied",
