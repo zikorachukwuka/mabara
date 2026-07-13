@@ -6,7 +6,7 @@ import re
 from urllib.parse import urlsplit
 
 from . import config, state
-from .tools import PLAN_TOOL, REPLACE_TOOL, RUN_TESTS_TOOL
+from .tools import NOTES_TOOL, PLAN_TOOL, REPLACE_TOOL, RUN_TESTS_TOOL
 
 READ_ONLY_TOOLS = {"Read", "Glob", "Grep"}
 # NOTE: the CLI runs its own read-only analysis first and auto-approves
@@ -268,8 +268,13 @@ def permission_decision(tool_name, tool_input, *, readonly, task_grants,
     # propose_plan is always free: the tool IS an approval — it speaks the
     # plan and takes the verdict itself; gating it would ask permission to
     # ask permission. It grants nothing until the user says yes into it.
+    # update_notes is free too, even in readonly: it can only write the
+    # agent's own notes file in Mabara's data dir — confined by
+    # construction, it cannot touch the repo (and never CLAUDE.md).
     if tool_name == PLAN_TOOL:
         return ("allow", "plan-tool")
+    if tool_name == NOTES_TOOL:
+        return ("allow", "notes")
 
     # Scout launches are free: a scout can only read, glob, and grep, and
     # every inner call it makes is gated here anyway. Any other agent type

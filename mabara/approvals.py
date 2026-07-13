@@ -69,6 +69,8 @@ def describe_tool_use(name, tool_input):
         find = str(tool_input.get("find", "?"))[:24]
         replace = str(tool_input.get("replace", "?"))[:24]
         return f'replace "{find}" with "{replace}" everywhere'
+    if name == policy.NOTES_TOOL:
+        return "update session notes"
     return name.lower()
 
 

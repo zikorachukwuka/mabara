@@ -784,11 +784,16 @@ def test_plan_grants_cover_edits_and_tests_only():
     assert set(tools.PLAN_GRANTS) == {"edits", policy.RUN_TESTS_TOOL}
 
 
-def test_plan_question_speaks_full_plan_first_delta_after():
+def test_plan_question_speaks_contract_not_steps():
+    # The steps live on screen (same split as diffs); speech carries the
+    # contract: goal, step count, verification, and the read-out offer
     first = tools.plan_spoken_question(
         "Rename the module", "1. Do a thing\n2. Do another",
         "run the tests")
-    assert "Here's my plan" in first and "Do a thing" in first
+    assert "2 steps" in first and "Rename the module" in first
+    assert "run the tests" in first
+    assert "Do a thing" not in first
+    assert "read it out" in first
     revised = tools.plan_spoken_question(
         "Rename the module", "1. Do a thing\n2. Do another",
         "grep for the pattern",
@@ -797,6 +802,16 @@ def test_plan_question_speaks_full_plan_first_delta_after():
     assert "Do a thing" not in revised
     assert "verification is now a grep check" in revised
     assert "Do you approve the plan?" in revised
+
+
+def test_plan_readout_available_on_request():
+    assert tools.wants_readout("read it out")
+    assert tools.wants_readout("let me hear the steps first")
+    assert not tools.wants_readout("yes")
+    assert not tools.wants_readout("no, skip the sql files")
+    speech = tools.plan_steps_speech("1. Do a thing\n2. Do another")
+    assert "Do a thing" in speech and "Then" in speech
+    assert speech.endswith("Do you approve the plan?")
 
 
 def test_detect_test_command_npm(tmp_path, monkeypatch):
@@ -1019,6 +1034,44 @@ def test_agent_feed_line_covers_both_launcher_names():
         line = approvals.describe_tool_use(launcher, {
             "subagent_type": "worker", "description": "execute the plan"})
         assert line == "worker: execute the plan"
+
+
+# ---------- Session notes (the agent's per-repo notebook) ----------
+
+def test_repo_notes_roundtrip(tmp_path, monkeypatch):
+    monkeypatch.setattr(context, "NOTES_DIR", str(tmp_path / "notes"))
+    repo = str(tmp_path / "somerepo")
+    assert context.load_repo_notes(repo) == ""          # first session
+    clipped = context.save_repo_notes(repo, "- uses pytest\n- CRLF endings")
+    assert clipped is False
+    assert context.load_repo_notes(repo) == "- uses pytest\n- CRLF endings"
+    # The file lives OUTSIDE the repo, in Mabara's data dir
+    assert not context.repo_notes_path(repo).startswith(repo)
+
+
+def test_repo_notes_keyed_per_repo_case_insensitive(tmp_path, monkeypatch):
+    monkeypatch.setattr(context, "NOTES_DIR", str(tmp_path / "notes"))
+    assert (context.repo_notes_path(r"C:\Users\x\repo")
+            == context.repo_notes_path(r"c:\users\x\REPO".lower()))
+    assert (context.repo_notes_path(r"C:\Users\x\repo")
+            != context.repo_notes_path(r"C:\Users\x\other"))
+
+
+def test_repo_notes_clipped_at_cap(tmp_path, monkeypatch):
+    monkeypatch.setattr(context, "NOTES_DIR", str(tmp_path / "notes"))
+    repo = str(tmp_path / "r")
+    assert context.save_repo_notes(repo, "x" * 100_000) is True
+    assert len(context.load_repo_notes(repo)) <= context.REPO_NOTES_MAX_CHARS
+
+
+def test_notes_tool_allowed_even_readonly(repo):
+    # Confined by construction: it can only write the agent's own notes
+    # file in Mabara's data dir — never the repo, never CLAUDE.md
+    assert _decide(policy.NOTES_TOOL, {"notes": "x"}) == ("allow", "notes")
+    assert _decide(policy.NOTES_TOOL, {"notes": "x"},
+                   readonly=True) == ("allow", "notes")
+    assert approvals.describe_tool_use(policy.NOTES_TOOL, {}) == \
+        "update session notes"
 
 
 # ---------- Project notes (CLAUDE.md read as data, never as settings) ----------
