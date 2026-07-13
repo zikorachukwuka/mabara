@@ -965,14 +965,38 @@ def test_task_feed_line_names_the_agent_type():
 
 def test_only_defined_agent_launches_pass_the_policy(repo):
     # Belt: no other agent type is defined. Suspenders: the policy refuses
-    # them anyway, even though the CLI may skip this callback for Task.
-    assert _decide("Task", {"subagent_type": "scout",
-                            "description": "d", "prompt": "p"}) == ("allow", "scout")
-    assert _decide("Task", {"subagent_type": "worker",
-                            "prompt": "p"}) == ("allow", "worker")
-    assert _decide("Task", {"subagent_type": "general-purpose",
-                            "prompt": "p"}) == ("deny", policy.OTHER_AGENT_DENY)
-    assert _decide("Task", {"prompt": "p"}) == ("deny", policy.OTHER_AGENT_DENY)
+    # them anyway, even though the CLI may skip this callback for launches.
+    # BOTH launcher names are gated — older CLIs say Task, newer say Agent
+    # (the rename silently blinded every Task fence, live 2026-07-13).
+    for launcher in policy.AGENT_LAUNCH_TOOLS:
+        assert _decide(launcher, {"subagent_type": "scout",
+                                  "description": "d", "prompt": "p"}) == ("allow", "scout")
+        assert _decide(launcher, {"subagent_type": "worker",
+                                  "prompt": "p"}) == ("allow", "worker")
+        assert _decide(launcher, {"subagent_type": "general-purpose",
+                                  "prompt": "p"}) == ("deny", policy.OTHER_AGENT_DENY)
+        assert _decide(launcher, {"prompt": "p"}) == ("deny", policy.OTHER_AGENT_DENY)
+
+
+def test_background_agents_are_refused_even_for_our_own_types(repo):
+    # A backgrounded worker's approvals orphan across turns (grants gone,
+    # microphone contested) — deny regardless of agent type
+    for launcher in policy.AGENT_LAUNCH_TOOLS:
+        for agent in ("scout", "worker"):
+            assert _decide(launcher, {
+                "subagent_type": agent, "prompt": "p",
+                "run_in_background": True,
+            }) == ("deny", policy.BACKGROUND_AGENT_DENY)
+    # Explicit false (or absent) stays allowed
+    assert _decide("Agent", {"subagent_type": "worker", "prompt": "p",
+                             "run_in_background": False}) == ("allow", "worker")
+
+
+def test_agent_feed_line_covers_both_launcher_names():
+    for launcher in policy.AGENT_LAUNCH_TOOLS:
+        line = approvals.describe_tool_use(launcher, {
+            "subagent_type": "worker", "description": "execute the plan"})
+        assert line == "worker: execute the plan"
 
 
 # ---------- Project notes (CLAUDE.md read as data, never as settings) ----------

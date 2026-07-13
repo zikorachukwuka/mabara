@@ -33,7 +33,9 @@ SCOUT_DESCRIPTION = (
     "files: architecture overviews, finding where something is handled "
     "across the codebase, tracing a flow. Give each scout ONE sharp, "
     "specific question; launch up to three in parallel for independent "
-    "questions. Not for anything a couple of reads would answer."
+    "questions. Not for anything a couple of reads would answer. "
+    "ALWAYS launch with run_in_background: false — a backgrounded agent "
+    "breaks the live voice loop."
 )
 
 WORKER_PROMPT = """\
@@ -65,7 +67,10 @@ WORKER_DESCRIPTION = (
     "propose_plan was approved, and only for big plans — four or more "
     "files, or a long grind. Pass the full approved plan text plus the "
     "context it needs (relevant paths, findings, constraints); it "
-    "reports back per step. Execute smaller plans yourself."
+    "reports back per step. Execute smaller plans yourself. ALWAYS "
+    "launch with run_in_background: false and wait for the result in "
+    "this turn — a backgrounded worker's approvals arrive after its "
+    "grants are gone and collide with the user's next conversation."
 )
 
 

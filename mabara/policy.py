@@ -226,6 +226,19 @@ OTHER_AGENT_DENY = (
 # makes still lands on this policy under whatever grants are in force.
 ALLOWED_AGENT_TYPES = ("scout", "worker")
 
+# The launcher tool's name depends on the CLI version: older CLIs call it
+# Task, newer ones Agent (observed live 2026-07-13 — every "Task" fence
+# silently missed until this tuple existed). Gate BOTH names, always.
+AGENT_LAUNCH_TOOLS = ("Task", "Agent")
+
+BACKGROUND_AGENT_DENY = (
+    "Background agents are disabled: the user is on a live voice call, "
+    "and a backgrounded agent's approvals arrive in later turns where "
+    "they collide with conversation — its task grants are gone by then "
+    "too. Relaunch the SAME agent with run_in_background set to false "
+    "and wait for its result in this turn."
+)
+
 
 def permission_decision(tool_name, tool_input, *, readonly, task_grants,
                         git_enabled, web_allowlist=frozenset()):
@@ -264,7 +277,13 @@ def permission_decision(tool_name, tool_input, *, readonly, task_grants,
     # DEFINED (mabara/agents.py), but the CLI has been observed skipping
     # this callback for Task (2026-07-05), so treat this branch as defense
     # in depth, not the lock on the door.
-    if tool_name == "Task":
+    if tool_name in AGENT_LAUNCH_TOOLS:
+        # Backgrounding is the deal-breaker, whatever the agent type: the
+        # 2026-07-13 live test backgrounded the worker, the turn ended and
+        # cleared the plan grant, and the worker's orphaned edit approvals
+        # then fought the user's next conversation for the microphone.
+        if tool_input.get("run_in_background"):
+            return ("deny", BACKGROUND_AGENT_DENY)
         agent_type = str(tool_input.get("subagent_type", "")).strip().lower()
         if agent_type in ALLOWED_AGENT_TYPES:
             return ("allow", agent_type)

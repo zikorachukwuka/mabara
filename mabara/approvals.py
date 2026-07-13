@@ -51,7 +51,7 @@ def describe_tool_use(name, tool_input):
     if name == "Bash":
         command = str(tool_input.get("command", "?"))
         return f"run: {command if len(command) <= 56 else command[:55] + '…'}"
-    if name == "Task":
+    if name in policy.AGENT_LAUNCH_TOOLS:
         agent = str(tool_input.get("subagent_type", "") or "agent")
         detail = str(tool_input.get("description", "") or tool_input.get("prompt", ""))
         return f"{agent}: {detail[:56]}"

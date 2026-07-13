@@ -6,7 +6,7 @@ import random
 import re
 import time
 
-from . import state, transcript
+from . import policy, state, transcript
 from .approvals import describe_tool_outcome, describe_tool_use
 from .config import PTT_LABEL
 from .session import ptt_pressed
@@ -320,7 +320,8 @@ async def ask_claude(client, text, speaker, label=None):
                             print(f"    {dim(f'{TOOL_MARK} {who} {TOOL_MARK} {action}')}")
                         else:
                             print(f"  {dim(f'{TOOL_MARK} {action}')}")
-                            if block.name == "Task" and getattr(block, "id", None):
+                            if (block.name in policy.AGENT_LAUNCH_TOOLS
+                                    and getattr(block, "id", None)):
                                 task_labels[block.id] = str(
                                     block.input.get("subagent_type", "")
                                     or "agent") if isinstance(block.input, dict) else "agent"
