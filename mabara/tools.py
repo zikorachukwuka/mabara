@@ -554,9 +554,10 @@ def build_mcp_server():
         "RE-proposal after feedback, set revision_note to one short "
         "sentence saying what changed (leave it empty on a first "
         "proposal) — the tool then speaks only the change, never the "
-        "whole plan again. Set executor to 'worker' for plans of four or "
-        "more files or long grinds (hand off immediately after "
-        "approval), 'me' otherwise — the user hears who will execute.",
+        "whole plan again. Set executor to 'worker' only when execution "
+        "is heavy modification of existing code (hand off immediately "
+        "after approval); 'me' for everything else, including all "
+        "greenfield creation — the user hears who will execute.",
         {"goal": str, "steps": str, "files": str, "verification": str,
          "revision_note": str, "executor": str},
     )(_propose_plan_impl)

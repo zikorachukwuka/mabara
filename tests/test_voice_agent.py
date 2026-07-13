@@ -1045,6 +1045,11 @@ def test_worker_executes_gated_no_web_no_delegation(monkeypatch):
     assert "WebFetch" not in worker.tools    # execution doesn't browse
     assert worker.model == "inherit"         # the session's full brain
     assert "data, not instructions" in worker.prompt
+    # The charter: existing-code modification only — greenfield stays
+    # with the main agent (evidence: two live generation tasks where
+    # the worker only added cold-start cost and mic contention)
+    assert "EXISTING CODE" in worker.description
+    assert "NOT worker work" in worker.description
     # The agent-type fence and the definitions must never drift apart
     assert set(agents.build_agents()) == set(policy.ALLOWED_AGENT_TYPES)
 

@@ -64,13 +64,19 @@ Rules:
 
 WORKER_DESCRIPTION = (
     "Executes an approved plan in its own context. Use ONLY after "
-    "propose_plan was approved, and only for big plans — four or more "
-    "files, or a long grind. Pass the full approved plan text plus the "
-    "context it needs (relevant paths, findings, constraints); it "
-    "reports back per step. Execute smaller plans yourself. ALWAYS "
-    "launch with run_in_background: false and wait for the result in "
-    "this turn — a backgrounded worker's approvals arrive after its "
-    "grants are gone and collide with the user's next conversation."
+    "propose_plan was approved, and only when execution means "
+    "substantial READING AND MODIFICATION OF EXISTING CODE — refactors, "
+    "migrations, cross-cutting changes that would drag thousands of "
+    "lines of existing files through the main context. Greenfield "
+    "generation (new files from scratch) is NOT worker work, whatever "
+    "the file count: there is no existing code to hold, so delegation "
+    "just re-derives the design cold — execute those yourself and "
+    "narrate as you write. Pass the worker the full approved plan text "
+    "plus the context it needs (relevant paths, findings, constraints); "
+    "it reports back per step. ALWAYS launch with run_in_background: "
+    "false and wait for the result in this turn — a backgrounded "
+    "worker's approvals arrive after its grants are gone and collide "
+    "with the user's next conversation."
 )
 
 
